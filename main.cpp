@@ -873,6 +873,23 @@ private:
         booting = false;
     }
 
+    void completeBoot() {
+        statusBar = "ONLINE";
+        appendOutput("System ready. Type program above and press F5 to run.\n");
+        showEditor = true;
+        if (editor.empty()) {
+            editor = "; Welcome to CPU-16\n";
+            editor += "; Write your program here\n";
+            editor += "MOV AX 0x002A\n";
+            editor += "MOV BX 0x0008\n";
+            editor += "ADD AX BX\n";
+            editor += "OUT 1 AX\n";
+            editor += "HLT\n";
+        }
+        updateEditorLines();
+        booting = false;
+    }
+
     void runProgram() {
         if (!isPowered) {
             appendOutput("ERROR: System is powered off\n");
@@ -1447,7 +1464,9 @@ private:
         text(caseX + caseW - 166 * scale, caseY + caseH - 68 * scale, "POWER", 0.9f * scale, 0.18f, 0.13f, 0.07f);
 
         // Footer: keep the control legend safely above the lower window edge.
-        const float footerY = caseY + caseH - 8 * scale;
+        // Lift the footer by roughly three text rows to prevent clipping on
+        // shorter displays and at larger UI scales.
+        const float footerY = caseY + caseH - 44 * scale;
         rect(caseX + 122 * scale, footerY, caseW - 244 * scale, 54 * scale, 0.43f, 0.32f, 0.19f);
         text(caseX + 150 * scale, footerY + 18 * scale,
              "[F11/P] POWER  [F5] RUN  [F2] RESET  [F1] HELP",
