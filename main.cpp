@@ -873,6 +873,23 @@ private:
         booting = false;
     }
 
+    void completeBoot() {
+        statusBar = "ONLINE";
+        appendOutput("System ready. Type program above and press F5 to run.\n");
+        showEditor = true;
+        if (editor.empty()) {
+            editor = "; Welcome to CPU-16\n";
+            editor += "; Write your program here\n";
+            editor += "MOV AX 0x002A\n";
+            editor += "MOV BX 0x0008\n";
+            editor += "ADD AX BX\n";
+            editor += "OUT 1 AX\n";
+            editor += "HLT\n";
+        }
+        updateEditorLines();
+        booting = false;
+    }
+
     void runProgram() {
         if (!isPowered) {
             appendOutput("ERROR: System is powered off\n");
