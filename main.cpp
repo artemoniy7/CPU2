@@ -277,9 +277,7 @@ private:
     sf::Sound powerOffSound;
     bool initialized = true;
     bool powerOnPlaying = false;
-    bool loopStarted = false;
-    float playTime = 0.0f;
-    sf::Clock clock;
+    static constexpr float powerOnLoopOffsetSeconds = 20.0f;
 
     void generateBeep(sf::SoundBuffer& buffer, float frequency, float duration) {
         const int sampleRate = 44100;
@@ -363,11 +361,9 @@ public:
         cout << "playPowerOn called\n";
         powerOnSound.stop();
         powerOnSound.setLooping(false);
-        loopStarted = false;
-        playTime = 0.0f;
+        powerOnSound.setPlayingOffset(sf::seconds(0.0f));
         powerOnSound.play();
         powerOnPlaying = true;
-        clock.restart();
         cout << "Power on sound started, status: " << (int)powerOnSound.getStatus() << "\n";
     }
     
@@ -379,7 +375,6 @@ public:
         
         cout << "playPowerOff called\n";
         powerOnPlaying = false;
-        loopStarted = false;
         powerOnSound.stop();
         powerOnSound.setLooping(false);
         
@@ -388,26 +383,15 @@ public:
         cout << "Power off sound started, status: " << (int)powerOffSound.getStatus() << "\n";
     }
     
-    void update(float deltaTime) {
+    void update() {
         if (!initialized || !powerOnPlaying) return;
-        
-        // Проверяем статус воспроизведения
-        auto status = powerOnSound.getStatus();
-        
-        if (status == sf::SoundSource::Status::Playing) {
-            playTime += deltaTime;
-            
-            // After 20 seconds, start looping
-            if (playTime >= 20.0f && !loopStarted) {
-                loopStarted = true;
-                powerOnSound.setLooping(true);
-                cout << "Power on sound looping started\n";
-            }
-        } else if (status == sf::SoundSource::Status::Stopped && !loopStarted) {
-            // Sound ended, restart it (only if not looping)
+
+        if (powerOnSound.getStatus() == sf::SoundSource::Status::Stopped) {
+            // The first pass is played in full. Every following pass starts at
+            // 20 seconds instead of repeating the intro.
+            powerOnSound.setPlayingOffset(sf::seconds(powerOnLoopOffsetSeconds));
             powerOnSound.play();
-            playTime = 0.0f;
-            cout << "Power on sound restarted\n";
+            cout << "Power on sound restarted from 20 seconds\n";
         }
     }
     
@@ -415,7 +399,6 @@ public:
         if (!initialized) return;
         cout << "stopPowerOn called\n";
         powerOnPlaying = false;
-        loopStarted = false;
         powerOnSound.stop();
         powerOnSound.setLooping(false);
     }
@@ -866,9 +849,27 @@ private:
         } else {
             statusBar = "OFFLINE";
             showEditor = false;
+            outputBuffer.clear();
             audio.stopPowerOn();
         }
         animating = false;
+        booting = false;
+    }
+
+    void completeBoot() {
+        statusBar = "ONLINE";
+        appendOutput("System ready. Type program above and press F5 to run.\n");
+        showEditor = true;
+        if (editor.empty()) {
+            editor = "; Welcome to CPU-16\n";
+            editor += "; Write your program here\n";
+            editor += "MOV AX 0x002A\n";
+            editor += "MOV BX 0x0008\n";
+            editor += "ADD AX BX\n";
+            editor += "OUT 1 AX\n";
+            editor += "HLT\n";
+        }
+        updateEditorLines();
         booting = false;
     }
 
@@ -1197,7 +1198,7 @@ private:
         lastUpdateTime = currentTime;
         
         // Update audio
-        audio.update(deltaTime);
+        audio.update();
         
         // Handle power on sound - запускаем сразу при начале загрузки
         if (booting && !powerOnSoundPlayed) {
@@ -1226,21 +1227,25 @@ private:
                 powerAnimation += animationSpeed;
                 if (powerAnimation >= 1.0f) {
                     powerAnimation = 1.0f;
-                    completePowerToggle();
+                    // Keep the boot screen active after the CRT has powered on.
+                    // The system becomes available only when the boot sequence ends.
+                    isPowered = true;
+                    cpu.setPowered(true);
+                    animating = false;
                 }
             }
         }
-        
+
         if (booting && isPowered) {
-            bootProgress += 0.003f;
+            constexpr float bootDurationSeconds = 6.8f;
+            bootProgress = min(1.0f, bootProgress + deltaTime / bootDurationSeconds);
             bootMessageTimer += deltaTime;
             if (bootMessageTimer > 0.8f && bootMessageIndex < (int)bootMessages.size() - 1) {
                 bootMessageIndex++;
                 bootMessageTimer = 0.0f;
             }
             if (bootProgress >= 1.0f) {
-                booting = false;
-                completePowerToggle();
+                completeBoot();
             }
         }
 
@@ -1278,8 +1283,8 @@ private:
         float screenB = 0.039f * brightness;
         rect(screenX, screenY, screenW, screenH, screenR, screenG, screenB);
         
-        if (!isPowered || powerAnimation < 0.3f) {
-            float alpha = isPowered ? 1.0f - powerAnimation * 3.0f : 1.0f;
+        if (booting || !isPowered || powerAnimation < 0.3f) {
+            float alpha = booting ? 1.0f : (isPowered ? 1.0f - powerAnimation * 3.0f : 1.0f);
             rect(screenX, screenY, screenW, screenH, 0.0f, 0.0f, 0.0f, alpha * 0.8f);
             
             string msg = "POWER OFF";
@@ -1296,17 +1301,38 @@ private:
             }
             
             if (booting) {
-                float barX = screenX + screenW * 0.1f;
-                float barY = screenY + screenH * 0.6f;
-                float barW = screenW * 0.8f;
-                float barH = 8 * scale;
-                
-                rect(barX, barY, barW, barH, 0.1f, 0.1f, 0.1f);
-                rect(barX, barY, barW * bootProgress, barH, 0.2f, 0.8f, 0.2f);
-                
+                const float panelX = screenX + screenW * 0.12f;
+                const float panelY = screenY + screenH * 0.27f;
+                const float panelW = screenW * 0.76f;
+                const float panelH = screenH * 0.46f;
+                const float pulse = 0.65f + 0.35f * sinf(static_cast<float>(currentTime) * 5.0f);
+                const float scanY = panelY + fmodf(static_cast<float>(currentTime) * 80.0f, panelH);
+
+                rect(panelX, panelY, panelW, panelH, 0.0f, 0.08f, 0.035f, 0.8f);
+                rect(panelX, panelY, panelW, 2 * scale, 0.18f, 0.9f, 0.48f, 0.9f);
+                rect(panelX, panelY + panelH - 2 * scale, panelW, 2 * scale, 0.08f, 0.45f, 0.25f, 0.7f);
+                rect(panelX, scanY, panelW, 2 * scale, 0.15f, 0.9f, 0.4f, 0.14f * pulse);
+
+                text(panelX + 22 * scale, panelY + 24 * scale,
+                     "CPU-16  /  SYSTEM BOOT", 1.6f * scale, 0.4f, 1.0f, 0.6f);
+                text(panelX + 22 * scale, panelY + 48 * scale,
+                     "SELF-TEST AND INITIALIZATION", 0.9f * scale, 0.25f, 0.65f, 0.36f);
+
+                float barX = panelX + 22 * scale;
+                float barY = panelY + panelH - 46 * scale;
+                float barW = panelW - 44 * scale;
+                float barH = 10 * scale;
+
+                rect(barX, barY, barW, barH, 0.03f, 0.18f, 0.08f);
+                rect(barX, barY, barW * bootProgress, barH, 0.16f, 0.9f, 0.42f);
+                rect(barX, barY - 2 * scale, barW * bootProgress, 2 * scale, 0.45f, 1.0f, 0.66f, pulse);
+
                 int msgIndex = min(bootMessageIndex, (int)bootMessages.size() - 1);
-                text(screenX + screenW/2 - bootMessages[msgIndex].length() * 1.5f * scale, 
-                     barY - 30 * scale, bootMessages[msgIndex], 1.5f * scale, 0.4f, 0.9f, 0.4f);
+                text(panelX + 22 * scale, barY - 28 * scale,
+                     "> " + bootMessages[msgIndex], 1.3f * scale, 0.4f, 0.95f, 0.48f);
+                text(panelX + panelW - 105 * scale, barY + 22 * scale,
+                     to_string(static_cast<int>(bootProgress * 100.0f)) + "% COMPLETE",
+                     0.85f * scale, 0.3f, 0.75f, 0.4f);
             }
         } else {
             // Active screen
