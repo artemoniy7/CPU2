@@ -1266,6 +1266,7 @@ private:
         const float bezel = 58 * scale;
         const float screenX = caseX + bezel, screenY = caseY + 82 * scale;
         const float screenW = caseW - 2 * bezel, screenH = 500 * scale;
+        const bool shuttingDown = animating && isPowered && !booting;
 
         // Case
         rect(caseX + 16 * scale, caseY + 20 * scale, caseW, caseH, 0.025f, 0.014f, 0.008f, 0.72f);
@@ -1277,13 +1278,14 @@ private:
         // Screen
         float brightness = isPowered ? (1.0f - powerAnimation * 0.5f) : (0.1f + powerAnimation * 0.3f);
         if (booting) brightness = bootProgress * 0.9f + 0.1f;
+        if (shuttingDown) brightness = max(0.05f, powerAnimation);
         
         float screenR = 0.0f * brightness;
         float screenG = 0.075f * brightness;
         float screenB = 0.039f * brightness;
         rect(screenX, screenY, screenW, screenH, screenR, screenG, screenB);
         
-        if (booting || !isPowered || powerAnimation < 0.3f) {
+        if (booting || !isPowered || (powerAnimation < 0.3f && !shuttingDown)) {
             float alpha = booting ? 1.0f : (isPowered ? 1.0f - powerAnimation * 3.0f : 1.0f);
             rect(screenX, screenY, screenW, screenH, 0.0f, 0.0f, 0.0f, alpha * 0.8f);
             
@@ -1405,6 +1407,29 @@ private:
             }
         }
 
+        if (shuttingDown) {
+            const float shutdownProgress = 1.0f - powerAnimation;
+            const float collapse = max(0.0f, min(1.0f, (shutdownProgress - 0.22f) / 0.78f));
+            const float visibleHeight = max(2.0f * scale, screenH * (1.0f - collapse));
+            const float lineY = screenY + screenH * 0.5f;
+            const float topEdge = lineY - visibleHeight * 0.5f;
+            const float bottomEdge = lineY + visibleHeight * 0.5f;
+            const float glow = 0.35f + 0.65f * (1.0f - collapse);
+
+            // Collapse the CRT image toward its centre line, leaving a short
+            // phosphor flash before the screen becomes fully dark.
+            rect(screenX, screenY, screenW, max(0.0f, topEdge - screenY), 0.0f, 0.0f, 0.0f, 0.96f);
+            rect(screenX, bottomEdge, screenW, max(0.0f, screenY + screenH - bottomEdge),
+                 0.0f, 0.0f, 0.0f, 0.96f);
+            rect(screenX, topEdge, screenW, visibleHeight, 0.0f, 0.0f, 0.0f, shutdownProgress * 0.7f);
+            rect(screenX, lineY - scale, screenW, 2.0f * scale, 0.35f * glow, 1.0f * glow, 0.55f * glow);
+
+            if (shutdownProgress < 0.55f) {
+                text(screenX + screenW * 0.5f - 54 * scale, lineY - 26 * scale,
+                     "SYSTEM HALT", 1.1f * scale, 0.3f * glow, 0.9f * glow, 0.45f * glow);
+            }
+        }
+
         // Physical details
         rect(caseX + 34 * scale, caseY + caseH - 120 * scale, 250 * scale, 42 * scale, 0.48f, 0.35f, 0.20f);
         text(caseX + 48 * scale, caseY + caseH - 107 * scale, "A R C A D E  1 6", 1.3f * scale, 0.12f, 0.09f, 0.05f);
@@ -1421,9 +1446,10 @@ private:
              0.15f * ledBrightness, 0.5f * ledBrightness, 0.2f * ledBrightness, 0.3f);
         text(caseX + caseW - 166 * scale, caseY + caseH - 68 * scale, "POWER", 0.9f * scale, 0.18f, 0.13f, 0.07f);
 
-        // Footer
-        rect(caseX + 122 * scale, caseY + caseH + 12 * scale, caseW - 244 * scale, 54 * scale, 0.43f, 0.32f, 0.19f);
-        text(caseX + 150 * scale, caseY + caseH + 30 * scale,
+        // Footer: keep the control legend safely above the lower window edge.
+        const float footerY = caseY + caseH - 8 * scale;
+        rect(caseX + 122 * scale, footerY, caseW - 244 * scale, 54 * scale, 0.43f, 0.32f, 0.19f);
+        text(caseX + 150 * scale, footerY + 18 * scale,
              "[F11/P] POWER  [F5] RUN  [F2] RESET  [F1] HELP",
              1.35f * scale, 0.76f, 0.64f, 0.40f);
     }
