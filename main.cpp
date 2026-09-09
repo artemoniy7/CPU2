@@ -1205,8 +1205,11 @@ private:
             powerOnSoundPlayed = true;
         }
         
-        // Handle power off sound
-        if (animating && !isPowered && !powerOffSoundPlayed) {
+        // While shutting down, the current state is still powered on until the
+        // animation completes.  Checking for !isPowered here caused the power-off
+        // sound to be played during the power-on animation, which immediately
+        // stopped the startup sound.
+        if (animating && isPowered && !powerOffSoundPlayed) {
             audio.playPowerOff();
             powerOffSoundPlayed = true;
         }
