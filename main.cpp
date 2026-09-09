@@ -10,106 +10,457 @@
 #include <cstdint>
 #include <string>
 #include <array>
+#include <fstream>
+#include <chrono>
+#include <thread>
+#include <filesystem>
+#include <cmath>
 #include <GLFW/glfw3.h>
+#include <SFML/Audio.hpp>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 using namespace std;
+namespace fs = std::filesystem;
 
 // ============================================================
-//  1. VIRTUAL DISK (10 MB)
+//  UTILITY FUNCTIONS
+// ============================================================
+string getExecutablePath() {
+#ifdef _WIN32
+    char buffer[1024];
+    GetModuleFileNameA(NULL, buffer, sizeof(buffer));
+    fs::path exePath(buffer);
+    return exePath.parent_path().string();
+#else
+    return fs::current_path().string();
+#endif
+}
+
+string getSoundsPath() {
+    fs::path exePath(getExecutablePath());
+    fs::path soundsPath = exePath / "sounds";
+    return soundsPath.string();
+}
+
+// ============================================================
+//  1. VIRTUAL DISK (10 MB) with Directory Support
 // ============================================================
 class VirtualDisk {
 private:
     static const size_t SIZE = 10 * 1024 * 1024;
     vector<uint8_t> data;
-    unordered_map<string, size_t> fileTable;
-    unordered_map<string, size_t> fileSizes;
+    
+    struct FileEntry {
+        size_t offset;
+        size_t size;
+        string path;
+        bool isDirectory;
+    };
+    
+    unordered_map<string, FileEntry> fileTable;
     string currentDir = "/";
+    string diskFileName;
+    
+    void loadFromDisk() {
+        ifstream file(diskFileName, ios::binary);
+        if (file) {
+            file.read(reinterpret_cast<char*>(data.data()), SIZE);
+            file.close();
+            cout << "Loaded disk from: " << diskFileName << "\n";
+        } else {
+            data.assign(SIZE, 0);
+            cout << "Created new disk: " << diskFileName << "\n";
+        }
+    }
+    
+    void saveToDisk() {
+        ofstream file(diskFileName, ios::binary);
+        if (file) {
+            file.write(reinterpret_cast<const char*>(data.data()), SIZE);
+            file.close();
+        }
+    }
+    
+    string normalizePath(const string& path) {
+        if (path.empty()) return currentDir;
+        if (path[0] == '/') return path;
+        if (currentDir == "/") return "/" + path;
+        return currentDir + "/" + path;
+    }
+    
+    string getParentPath(const string& path) {
+        if (path == "/") return "/";
+        size_t pos = path.find_last_of('/');
+        if (pos == 0) return "/";
+        if (pos == string::npos) return "/";
+        return path.substr(0, pos);
+    }
+    
+    string getFileName(const string& path) {
+        if (path == "/") return "/";
+        size_t pos = path.find_last_of('/');
+        if (pos == string::npos) return path;
+        return path.substr(pos + 1);
+    }
+    
+    void createDirectoryEntry(const string& path) {
+        FileEntry entry;
+        entry.offset = 0;
+        entry.size = 0;
+        entry.path = path;
+        entry.isDirectory = true;
+        fileTable[path] = entry;
+    }
 
 public:
-    VirtualDisk() : data(SIZE, 0) {}
-
+    VirtualDisk() {
+        fs::path exePath(getExecutablePath());
+        diskFileName = (exePath / "memory.bin").string();
+        loadFromDisk();
+        if (fileTable.empty()) {
+            createDirectoryEntry("/");
+            saveToDisk();
+        }
+    }
+    
+    ~VirtualDisk() {
+        saveToDisk();
+    }
+    
+    bool createDirectory(const string& path) {
+        string normalized = normalizePath(path);
+        if (fileTable.count(normalized)) return false;
+        
+        string parent = getParentPath(normalized);
+        if (!fileTable.count(parent) || !fileTable[parent].isDirectory) return false;
+        
+        createDirectoryEntry(normalized);
+        saveToDisk();
+        return true;
+    }
+    
     bool createFile(const string& name) {
-        if (fileTable.count(name)) return false;
+        string normalized = normalizePath(name);
+        if (fileTable.count(normalized)) return false;
+        
+        string parent = getParentPath(normalized);
+        if (!fileTable.count(parent) || !fileTable[parent].isDirectory) return false;
+        
         size_t offset = 0;
-        for (auto& [fname, foffset] : fileTable)
-            offset = max(offset, foffset + fileSizes[fname]);
+        for (auto& [fname, entry] : fileTable) {
+            if (!entry.isDirectory) {
+                offset = max(offset, entry.offset + entry.size);
+            }
+        }
         if (offset + 1024 > SIZE) return false;
-        fileTable[name] = offset;
-        fileSizes[name] = 0;
+        
+        FileEntry entry;
+        entry.offset = offset;
+        entry.size = 0;
+        entry.path = normalized;
+        entry.isDirectory = false;
+        fileTable[normalized] = entry;
+        saveToDisk();
         return true;
     }
-
+    
     bool appendToFile(const string& name, const string& content) {
-        if (!fileTable.count(name)) return false;
-        size_t offset = fileTable[name] + fileSizes[name];
+        string normalized = normalizePath(name);
+        if (!fileTable.count(normalized) || fileTable[normalized].isDirectory) return false;
+        
+        size_t offset = fileTable[normalized].offset + fileTable[normalized].size;
         if (offset + content.size() > SIZE) return false;
+        
         copy(content.begin(), content.end(), data.begin() + offset);
-        fileSizes[name] += content.size();
+        fileTable[normalized].size += content.size();
+        saveToDisk();
         return true;
     }
-
+    
     string readFile(const string& name) {
-        if (!fileTable.count(name)) return "";
-        size_t offset = fileTable[name];
-        size_t size = fileSizes[name];
+        string normalized = normalizePath(name);
+        if (!fileTable.count(normalized) || fileTable[normalized].isDirectory) return "";
+        
+        size_t offset = fileTable[normalized].offset;
+        size_t size = fileTable[normalized].size;
+        if (offset + size > SIZE) return "";
         return string(data.begin() + offset, data.begin() + offset + size);
     }
-
+    
     bool writeFile(const string& name, const string& content) {
-        if (!fileTable.count(name)) return false;
-        fileSizes[name] = 0;
+        string normalized = normalizePath(name);
+        if (!fileTable.count(normalized) || fileTable[normalized].isDirectory) return false;
+        
+        fileTable[normalized].size = 0;
+        saveToDisk();
         return appendToFile(name, content);
     }
-
-    void listFiles() {
-        cout << "\n--- Files on disk (" << SIZE/1024/1024 << " MB) ---\n";
-        for (auto& [name, offset] : fileTable)
-            cout << "  " << name << " (" << fileSizes[name] << " bytes)\n";
-        cout << "------------------------------------\n";
+    
+    string listFiles() {
+        ostringstream output;
+        output << "\n--- Files on disk (" << SIZE/1024/1024 << " MB) ---\n";
+        output << "Current directory: " << currentDir << "\n\n";
+        
+        for (auto& [path, entry] : fileTable) {
+            if (path == "/" || path == currentDir) continue;
+            string parent = getParentPath(path);
+            if (parent != currentDir) continue;
+            
+            string name = getFileName(path);
+            if (entry.isDirectory) {
+                output << "  [DIR]  " << name << "/\n";
+            } else {
+                output << "  [FILE] " << name << " (" << entry.size << " bytes)\n";
+            }
+        }
+        output << "------------------------------------\n";
+        return output.str();
     }
-
-    bool fileExists(const string& name) { return fileTable.count(name) > 0; }
-    size_t getFileSize(const string& name) { return fileSizes[name]; }
-    void reset() { data.assign(SIZE, 0); fileTable.clear(); fileSizes.clear(); }
+    
+    bool changeDirectory(const string& path) {
+        string normalized = normalizePath(path);
+        if (!fileTable.count(normalized) || !fileTable[normalized].isDirectory) return false;
+        currentDir = normalized;
+        return true;
+    }
+    
+    string getCurrentDirectory() const {
+        return currentDir;
+    }
+    
+    bool fileExists(const string& name) {
+        string normalized = normalizePath(name);
+        return fileTable.count(normalized) > 0;
+    }
+    
+    size_t getFileSize(const string& name) {
+        string normalized = normalizePath(name);
+        if (!fileTable.count(normalized) || fileTable[normalized].isDirectory) return 0;
+        return fileTable[normalized].size;
+    }
+    
+    void reset() {
+        data.assign(SIZE, 0);
+        fileTable.clear();
+        createDirectoryEntry("/");
+        currentDir = "/";
+        saveToDisk();
+    }
+    
+    uint8_t readByte(size_t addr) const {
+        if (addr < SIZE) return data[addr];
+        return 0;
+    }
+    
+    void writeByte(size_t addr, uint8_t val) {
+        if (addr < SIZE) {
+            data[addr] = val;
+            saveToDisk();
+        }
+    }
+    
+    void* getData() { return data.data(); }
+    size_t getSize() const { return SIZE; }
 };
 
 // ============================================================
-//  2. 16-BIT CPU WITH FLAGS AND CACHE
+//  2. AUDIO MANAGER - Исправленная версия для SFML 3.x
+// ============================================================
+class AudioManager {
+private:
+    sf::SoundBuffer powerOnBuffer;
+    sf::SoundBuffer powerOffBuffer;
+    sf::Sound powerOnSound;
+    sf::Sound powerOffSound;
+    bool initialized = true;
+    bool powerOnPlaying = false;
+    bool loopStarted = false;
+    float playTime = 0.0f;
+    sf::Clock clock;
+
+    void generateBeep(sf::SoundBuffer& buffer, float frequency, float duration) {
+        const int sampleRate = 44100;
+        const int numSamples = static_cast<int>(sampleRate * duration);
+        vector<int16_t> samples(numSamples);
+        
+        for (int i = 0; i < numSamples; ++i) {
+            float t = static_cast<float>(i) / sampleRate;
+            float value = sinf(2.0f * 3.14159f * frequency * t) * 0.5f;
+            float decay = 1.0f - (t / duration);
+            value *= decay;
+            samples[i] = static_cast<int16_t>(value * 32767.0f);
+        }
+        buffer.loadFromSamples(samples.data(), numSamples, 1, sampleRate, {});
+    }
+
+public:
+    AudioManager() : powerOnSound(powerOnBuffer), powerOffSound(powerOffBuffer) {
+        string soundsPath = getSoundsPath();
+        string soundPath = soundsPath + "/power_on.ogg";
+        string soundOffPath = soundsPath + "/power_off.ogg";
+        
+        cout << "Looking for power_on.ogg at: " << soundPath << "\n";
+        cout << "Looking for power_off.ogg at: " << soundOffPath << "\n";
+        
+        bool loadedOn = false;
+        bool loadedOff = false;
+        
+        // Load power on sound
+        if (powerOnBuffer.loadFromFile(soundPath)) {
+            cout << "Loaded power_on.ogg successfully\n";
+            loadedOn = true;
+        } else {
+            // Try WAV
+            string wavPath = soundsPath + "/power_on.wav";
+            if (powerOnBuffer.loadFromFile(wavPath)) {
+                cout << "Loaded power_on.wav successfully\n";
+                loadedOn = true;
+            }
+        }
+        
+        if (!loadedOn) {
+            cout << "Warning: Could not load power_on sound, generating beep\n";
+            generateBeep(powerOnBuffer, 440.0f, 0.3f);
+        }
+        
+        // Load power off sound
+        if (powerOffBuffer.loadFromFile(soundOffPath)) {
+            cout << "Loaded power_off.ogg successfully\n";
+            loadedOff = true;
+        } else {
+            string wavPath = soundsPath + "/power_off.wav";
+            if (powerOffBuffer.loadFromFile(wavPath)) {
+                cout << "Loaded power_off.wav successfully\n";
+                loadedOff = true;
+            }
+        }
+        
+        if (!loadedOff) {
+            cout << "Warning: Could not load power_off sound, generating beep\n";
+            generateBeep(powerOffBuffer, 220.0f, 0.2f);
+        }
+        
+        powerOnSound.setBuffer(powerOnBuffer);
+        powerOffSound.setBuffer(powerOffBuffer);
+        initialized = true;
+        cout << "AudioManager initialized successfully\n";
+    }
+    
+    ~AudioManager() {
+        powerOnSound.stop();
+        powerOffSound.stop();
+    }
+    
+    void playPowerOn() {
+        if (!initialized) {
+            cout << "AudioManager not initialized\n";
+            return;
+        }
+        
+        cout << "playPowerOn called\n";
+        powerOnSound.stop();
+        powerOnSound.setLooping(false);
+        loopStarted = false;
+        playTime = 0.0f;
+        powerOnSound.play();
+        powerOnPlaying = true;
+        clock.restart();
+        cout << "Power on sound started, status: " << (int)powerOnSound.getStatus() << "\n";
+    }
+    
+    void playPowerOff() {
+        if (!initialized) {
+            cout << "AudioManager not initialized\n";
+            return;
+        }
+        
+        cout << "playPowerOff called\n";
+        powerOnPlaying = false;
+        loopStarted = false;
+        powerOnSound.stop();
+        powerOnSound.setLooping(false);
+        
+        powerOffSound.stop();
+        powerOffSound.play();
+        cout << "Power off sound started, status: " << (int)powerOffSound.getStatus() << "\n";
+    }
+    
+    void update(float deltaTime) {
+        if (!initialized || !powerOnPlaying) return;
+        
+        // Проверяем статус воспроизведения
+        auto status = powerOnSound.getStatus();
+        
+        if (status == sf::SoundSource::Status::Playing) {
+            playTime += deltaTime;
+            
+            // After 20 seconds, start looping
+            if (playTime >= 20.0f && !loopStarted) {
+                loopStarted = true;
+                powerOnSound.setLooping(true);
+                cout << "Power on sound looping started\n";
+            }
+        } else if (status == sf::SoundSource::Status::Stopped && !loopStarted) {
+            // Sound ended, restart it (only if not looping)
+            powerOnSound.play();
+            playTime = 0.0f;
+            cout << "Power on sound restarted\n";
+        }
+    }
+    
+    void stopPowerOn() {
+        if (!initialized) return;
+        cout << "stopPowerOn called\n";
+        powerOnPlaying = false;
+        loopStarted = false;
+        powerOnSound.stop();
+        powerOnSound.setLooping(false);
+    }
+    
+    bool isPowerOnPlaying() const {
+        return powerOnPlaying;
+    }
+};
+
+// ============================================================
+//  3. 16-BIT CPU WITH FLAGS AND CACHE
 // ============================================================
 class CPU {
 private:
-    // ---- Registers ----
     uint16_t AX=0, BX=0, CX=0, DX=0;
     uint16_t SP=0xFFFE, BP=0, SI=0, DI=0;
     uint16_t CS=0, DS=0, SS=0, ES=0;
     uint16_t IP = 0;
 
-    // ---- Flags ----
     bool ZF=false, CF=false, SF=false, OF=false, DF=false;
     stack<uint16_t> callStack;
 
-    // ---- Cache ----
     struct CacheLine { bool valid=false; uint32_t tag=0; uint8_t data[64]; };
     static const int CACHE_SIZE = 8;
     CacheLine cache[CACHE_SIZE];
 
     VirtualDisk* disk;
-    bool debugMode = true;
+    bool debugMode = false;
+    bool powered = false;
 
 public:
     CPU(VirtualDisk* d) : disk(d) {}
 
     void setDebug(bool on) { debugMode = on; }
+    void setPowered(bool on) { powered = on; }
+    bool isPowered() const { return powered; }
 
-    // ---- Register access for debugging ----
     void printRegs() {
+        if (!powered) return;
         cout << "AX=0x" << hex << setw(4) << setfill('0') << AX
              << " BX=0x" << setw(4) << BX
              << " CX=0x" << setw(4) << CX
              << " DX=0x" << setw(4) << DX << "\n";
         cout << "SP=0x" << setw(4) << SP << " BP=0x" << setw(4) << BP
              << " SI=0x" << setw(4) << SI << " DI=0x" << setw(4) << DI << "\n";
-        cout << "ZF=" << ZF << " CF=" << CF << " SF=" << SF << " OF=" << OF << " DF=" << DF << "\n";
     }
 
     void reset() {
@@ -119,46 +470,44 @@ public:
         for(auto& line : cache) line.valid = false;
     }
 
-    // ---- Memory operations (with cache) ----
     uint8_t readByte(uint32_t addr) {
+        if (!powered) return 0;
         uint32_t tag = addr / 64, offset = addr % 64;
         for (int i = 0; i < CACHE_SIZE; i++)
             if (cache[i].valid && cache[i].tag == tag)
                 return cache[i].data[offset];
 
-        if (debugMode) cout << "[Cache miss] Loading block " << tag << "\n";
         int idx = addr % CACHE_SIZE;
         cache[idx].valid = true;
         cache[idx].tag = tag;
-        string content = disk->readFile("program.asm");
-        for (size_t i = 0; i < 64 && i + tag * 64 < content.size(); i++)
-            cache[idx].data[i] = content[i + tag * 64];
+        for (size_t i = 0; i < 64; i++)
+            cache[idx].data[i] = disk->readByte(tag * 64 + i);
         return cache[idx].data[offset];
     }
 
     uint16_t readWord(uint32_t addr) {
+        if (!powered) return 0;
         return readByte(addr) | (readByte(addr+1) << 8);
     }
 
     void writeByte(uint32_t addr, uint8_t val) {
+        if (!powered) return;
         uint32_t tag = addr / 64, offset = addr % 64;
         for (int i = 0; i < CACHE_SIZE; i++)
             if (cache[i].valid && cache[i].tag == tag) {
                 cache[i].data[offset] = val;
+                disk->writeByte(addr, val);
                 return;
             }
-        // If not in cache - write directly (simplified)
-        string content = disk->readFile("program.asm");
-        if (addr < content.size()) content[addr] = val;
-        disk->writeFile("program.asm", content);
+        disk->writeByte(addr, val);
     }
 
     void writeWord(uint32_t addr, uint16_t val) {
+        if (!powered) return;
         writeByte(addr, val & 0xFF);
         writeByte(addr+1, (val >> 8) & 0xFF);
     }
 
-    // ---- Helper functions for arithmetic ----
     void setFlagsForResult(uint16_t result, uint16_t op1, uint16_t op2, bool isAdd) {
         ZF = (result == 0);
         SF = (result & 0x8000) != 0;
@@ -173,15 +522,18 @@ public:
         }
     }
 
-    // ---- Interpreter ----
-    void executeProgram(const string& code) {
-        if (debugMode) cout << "\n=== EXECUTING PROGRAM ===\n";
+    string executeProgram(const string& code) {
+        ostringstream output;
+        if (!powered) {
+            output << "CPU is powered off\n";
+            return output.str();
+        }
+        
         istringstream iss(code);
         string line;
         unordered_map<string, int> labels;
         vector<string> lines;
 
-        // First pass: collect lines and labels
         while (getline(iss, line)) {
             size_t comment = line.find(';');
             if (comment != string::npos) line = line.substr(0, comment);
@@ -196,21 +548,22 @@ public:
             lines.push_back(line);
         }
 
-        // Second pass: execution
         IP = 0;
         while (IP < lines.size()) {
+            if (!powered) {
+                output << "CPU powered off during execution\n";
+                return output.str();
+            }
             string instr = lines[IP];
             IP++;
             istringstream cmdStream(instr);
             string opcode;
             cmdStream >> opcode;
 
-            // ---- Instruction handling ----
             if (opcode == "MOV") {
                 string dest, src; cmdStream >> dest >> src;
                 uint16_t val = getValue(src);
                 setRegister(dest, val);
-                if (debugMode) cout << "  MOV " << dest << ", " << src << " -> " << dest << " = 0x" << hex << val << "\n";
             }
             else if (opcode == "XCHG") {
                 string r1, r2; cmdStream >> r1 >> r2;
@@ -218,20 +571,17 @@ public:
                 uint16_t val2 = getRegister(r2);
                 setRegister(r1, val2);
                 setRegister(r2, val1);
-                if (debugMode) cout << "  XCHG " << r1 << ", " << r2 << "\n";
             }
             else if (opcode == "PUSH") {
                 string src; cmdStream >> src;
                 SP -= 2;
                 writeWord(SP, getValue(src));
-                if (debugMode) cout << "  PUSH " << src << " (SP=0x" << hex << SP << ")\n";
             }
             else if (opcode == "POP") {
                 string dest; cmdStream >> dest;
                 uint16_t val = readWord(SP);
                 SP += 2;
                 setRegister(dest, val);
-                if (debugMode) cout << "  POP " << dest << " = 0x" << hex << val << "\n";
             }
             else if (opcode == "ADD" || opcode == "SUB" || opcode == "CMP") {
                 string dest, src; cmdStream >> dest >> src;
@@ -241,28 +591,24 @@ public:
                                  (opcode == "SUB") ? val1 - val2 : val1 - val2;
                 if (opcode != "CMP") setRegister(dest, result);
                 setFlagsForResult(result, val1, val2, opcode == "ADD");
-                if (debugMode) cout << "  " << opcode << " " << dest << ", " << src << " -> result=0x" << hex << result << "\n";
             }
             else if (opcode == "INC") {
                 string dest; cmdStream >> dest;
                 uint16_t val = getRegister(dest) + 1;
                 setRegister(dest, val);
                 ZF = (val == 0); SF = (val & 0x8000) != 0;
-                if (debugMode) cout << "  INC " << dest << " = 0x" << hex << val << "\n";
             }
             else if (opcode == "DEC") {
                 string dest; cmdStream >> dest;
                 uint16_t val = getRegister(dest) - 1;
                 setRegister(dest, val);
                 ZF = (val == 0); SF = (val & 0x8000) != 0;
-                if (debugMode) cout << "  DEC " << dest << " = 0x" << hex << val << "\n";
             }
             else if (opcode == "NEG") {
                 string dest; cmdStream >> dest;
                 uint16_t val = -getRegister(dest);
                 setRegister(dest, val);
                 ZF = (val == 0); SF = (val & 0x8000) != 0; CF = (val != 0);
-                if (debugMode) cout << "  NEG " << dest << " = 0x" << hex << val << "\n";
             }
             else if (opcode == "MUL" || opcode == "IMUL") {
                 string src; cmdStream >> src;
@@ -271,123 +617,115 @@ public:
                 AX = result & 0xFFFF;
                 DX = (result >> 16) & 0xFFFF;
                 ZF = (AX == 0); SF = (AX & 0x8000) != 0; CF = (DX != 0);
-                if (debugMode) cout << "  " << opcode << " " << src << " -> AX=0x" << hex << AX << " DX=0x" << DX << "\n";
             }
             else if (opcode == "DIV" || opcode == "IDIV") {
                 string src; cmdStream >> src;
                 uint16_t divisor = getValue(src);
-                if (divisor == 0) { cout << "  [ERROR] Division by zero!\n"; return; }
+                if (divisor == 0) { output << "Division by zero!\n"; return output.str(); }
                 uint32_t dividend = (DX << 16) | AX;
                 AX = dividend / divisor;
                 DX = dividend % divisor;
-                if (debugMode) cout << "  " << opcode << " " << src << " -> AX=0x" << hex << AX << " DX=0x" << DX << "\n";
             }
             else if (opcode == "LOAD") {
                 string dest, addr; cmdStream >> dest >> addr;
                 uint16_t val = readWord(getValue(addr));
                 setRegister(dest, val);
-                if (debugMode) cout << "  LOAD " << dest << ", " << addr << " -> " << dest << " = 0x" << hex << val << "\n";
             }
             else if (opcode == "STORE") {
                 string src, addr; cmdStream >> src >> addr;
                 writeWord(getValue(addr), getRegister(src));
-                if (debugMode) cout << "  STORE " << src << ", " << addr << "\n";
             }
             else if (opcode == "IN") {
                 string dest, port; cmdStream >> dest >> port;
                 uint16_t val = 0;
-                cout << "  [INPUT] Enter number for port " << port << ": ";
-                cin >> val;
+                output << "Input for port " << port << ": ";
                 setRegister(dest, val);
-                if (debugMode) cout << "  IN " << dest << ", " << port << " -> " << dest << " = 0x" << hex << val << "\n";
             }
             else if (opcode == "OUT") {
                 string port, src; cmdStream >> port >> src;
                 uint16_t val = getValue(src);
-                cout << "  [OUTPUT] Port " << port << " = 0x" << hex << val << " (" << dec << val << ")\n";
-                if (debugMode) cout << "  OUT " << port << ", " << src << "\n";
+                output << "Port " << port << " = 0x" << hex << val << " (" << dec << val << ")\n";
             }
             else if (opcode == "PEEK") {
                 string addr; cmdStream >> addr;
                 uint16_t val = readByte(getValue(addr));
-                cout << "  0x" << hex << setw(4) << setfill('0') << getValue(addr)
-                     << " = 0x" << setw(2) << (int)val << "\n";
+                output << "0x" << hex << setw(4) << setfill('0') << getValue(addr)
+                       << " = 0x" << setw(2) << (int)val << "\n";
             }
             else if (opcode == "POKE") {
                 string addr, val; cmdStream >> addr >> val;
                 writeByte(getValue(addr), getValue(val) & 0xFF);
-                if (debugMode) cout << "  POKE " << addr << ", " << val << "\n";
             }
             else if (opcode == "DUMP") {
                 string addr, len; cmdStream >> addr >> len;
                 uint32_t start = getValue(addr);
                 uint32_t length = getValue(len);
                 for (uint32_t i = 0; i < length; i += 16) {
-                    cout << "0x" << hex << setw(6) << setfill('0') << (start+i) << ": ";
+                    output << "0x" << hex << setw(6) << setfill('0') << (start+i) << ": ";
                     for (uint32_t j = 0; j < 16 && i+j < length; j++)
-                        cout << setw(2) << (int)readByte(start+i+j) << " ";
-                    cout << "\n";
+                        output << setw(2) << (int)readByte(start+i+j) << " ";
+                    output << "\n";
                 }
             }
             else if (opcode == "PRINT") {
                 string arg; cmdStream >> arg;
                 if (arg[0] == '"' && arg.back() == '"') {
-                    cout << "  " << arg.substr(1, arg.size()-2) << "\n";
+                    output << arg.substr(1, arg.size()-2) << "\n";
                 } else {
                     uint16_t val = getValue(arg);
-                    cout << "  0x" << hex << val << " (" << dec << val << ")\n";
+                    output << "0x" << hex << val << " (" << dec << val << ")\n";
                 }
             }
-            else if (opcode == "CLC") { CF = false; if (debugMode) cout << "  CLC (CF=0)\n"; }
-            else if (opcode == "STC") { CF = true;  if (debugMode) cout << "  STC (CF=1)\n"; }
-            else if (opcode == "CMC") { CF = !CF;   if (debugMode) cout << "  CMC (CF=" << CF << ")\n"; }
-            else if (opcode == "CLD") { DF = false; if (debugMode) cout << "  CLD (DF=0)\n"; }
-            else if (opcode == "STD") { DF = true;  if (debugMode) cout << "  STD (DF=1)\n"; }
-            else if (opcode == "NOP") { if (debugMode) cout << "  NOP\n"; }
-            else if (opcode == "HLT") { if (debugMode) cout << "  [HLT] Program terminated\n"; return; }
+            else if (opcode == "CLC") { CF = false; }
+            else if (opcode == "STC") { CF = true; }
+            else if (opcode == "CMC") { CF = !CF; }
+            else if (opcode == "CLD") { DF = false; }
+            else if (opcode == "STD") { DF = true; }
+            else if (opcode == "NOP") { }
+            else if (opcode == "HLT") { output << "Program terminated\n"; return output.str(); }
             else if (opcode == "JMP") {
                 string label; cmdStream >> label;
-                if (labels.count(label)) { IP = labels[label]; if (debugMode) cout << "  JMP " << label << "\n"; }
-                else { cout << "  [ERROR] Label " << label << " not found\n"; return; }
+                if (labels.count(label)) { IP = labels[label]; }
+                else { output << "Label " << label << " not found\n"; return output.str(); }
             }
             else if (opcode == "JE" || opcode == "JZ") {
                 string label; cmdStream >> label;
-                if (ZF && labels.count(label)) { IP = labels[label]; if (debugMode) cout << "  " << opcode << " " << label << " (ZF=1)\n"; }
+                if (ZF && labels.count(label)) { IP = labels[label]; }
             }
             else if (opcode == "JNE" || opcode == "JNZ") {
                 string label; cmdStream >> label;
-                if (!ZF && labels.count(label)) { IP = labels[label]; if (debugMode) cout << "  " << opcode << " " << label << " (ZF=0)\n"; }
+                if (!ZF && labels.count(label)) { IP = labels[label]; }
             }
             else if (opcode == "JG") {
                 string label; cmdStream >> label;
-                if (!ZF && !SF && !OF && labels.count(label)) { IP = labels[label]; if (debugMode) cout << "  JG " << label << "\n"; }
+                if (!ZF && !SF && !OF && labels.count(label)) { IP = labels[label]; }
             }
             else if (opcode == "JL") {
                 string label; cmdStream >> label;
-                if (SF != OF && labels.count(label)) { IP = labels[label]; if (debugMode) cout << "  JL " << label << "\n"; }
+                if (SF != OF && labels.count(label)) { IP = labels[label]; }
             }
             else if (opcode == "CALL") {
                 string label; cmdStream >> label;
                 if (labels.count(label)) {
                     callStack.push(IP);
                     IP = labels[label];
-                    if (debugMode) cout << "  CALL " << label << "\n";
-                } else { cout << "  [ERROR] Label " << label << " not found\n"; return; }
+                } else { output << "Label " << label << " not found\n"; return output.str(); }
             }
             else if (opcode == "RET") {
-                if (!callStack.empty()) { IP = callStack.top(); callStack.pop(); if (debugMode) cout << "  RET\n"; }
-                else { cout << "  [ERROR] RET without CALL\n"; return; }
+                if (!callStack.empty()) { IP = callStack.top(); callStack.pop(); }
+                else { output << "RET without CALL\n"; return output.str(); }
             }
             else if (opcode == "LOOP") {
                 string label; cmdStream >> label;
                 CX--;
-                if (CX != 0 && labels.count(label)) { IP = labels[label]; if (debugMode) cout << "  LOOP " << label << " (CX=" << CX << ")\n"; }
+                if (CX != 0 && labels.count(label)) { IP = labels[label]; }
             }
             else {
-                cout << "  [ERROR] Unknown instruction: " << opcode << "\n";
-                return;
+                output << "Unknown instruction: " << opcode << "\n";
+                return output.str();
             }
         }
+        return output.str();
     }
 
 private:
@@ -431,75 +769,318 @@ private:
 };
 
 // ============================================================
-//  3. FULL-SCREEN GLFW TERMINAL INTERFACE
+//  4. FULL-SCREEN GLFW TERMINAL INTERFACE
 // ============================================================
 class TerminalInterface {
 private:
     VirtualDisk disk;
     CPU cpu;
+    AudioManager audio;
     GLFWwindow* window = nullptr;
-    string editor =
-        "; HELLO FROM THE 16-BIT CPU\n"
-        "MOV AX 0x002A\n"
-        "MOV BX 0x0008\n"
-        "ADD AX BX\n"
-        "OUT 1 AX\n"
-        "HLT\n";
-    string log = "SYSTEM READY.  EDIT THE PROGRAM AND PRESS F5 TO RUN.\n";
-    string status = "ONLINE";
+    
+    // Editor state
+    string editor = "";
+    string editorFileName;
+    string outputBuffer = "";
+    string statusBar = "OFFLINE";
+    string currentDir = "/";
+    
     bool showHelp = false;
     bool cursorVisible = true;
     double lastBlink = 0.0;
+    bool isPowered = false;
+    float powerAnimation = 0.0f;
+    bool animating = false;
+    float animationSpeed = 0.015f;
+    bool booting = false;
+    float bootProgress = 0.0f;
+    vector<string> bootMessages;
+    int bootMessageIndex = 0;
+    float bootMessageTimer = 0.0f;
+    bool showEditor = false;
+    bool powerOnSoundPlayed = false;
+    bool powerOffSoundPlayed = false;
+    
+    int cursorLine = 0;
+    int cursorCol = 0;
+    vector<string> editorLines;
+    int editorScroll = 0;
+    
+    double lastUpdateTime = 0.0;
 
-    void appendLog(const string& message) {
-        log += message;
-        if (!log.empty() && log.back() != '\n') log += '\n';
-        constexpr size_t maxLogLength = 2600;
-        if (log.size() > maxLogLength) log.erase(0, log.size() - maxLogLength);
+    void appendOutput(const string& message) {
+        if (message.empty()) return;
+        outputBuffer += message;
+        if (outputBuffer.size() > 2000) {
+            size_t pos = outputBuffer.find('\n', outputBuffer.size() - 1000);
+            if (pos != string::npos) outputBuffer.erase(0, pos + 1);
+        }
+    }
+
+    void togglePower() {
+        if (animating) return;
+        animating = true;
+        if (isPowered) {
+            booting = false;
+            statusBar = "SHUTTING DOWN";
+            powerOffSoundPlayed = false;
+            audio.stopPowerOn();
+        } else {
+            booting = true;
+            bootProgress = 0.0f;
+            bootMessageIndex = 0;
+            bootMessageTimer = 0.0f;
+            bootMessages = {
+                "Initializing CPU...",
+                "Loading microcode...",
+                "Testing RAM...",
+                "Initializing disk controller...",
+                "Mounting virtual disk...",
+                "Loading system files...",
+                "Starting terminal...",
+                "System ready."
+            };
+            statusBar = "BOOTING";
+            showEditor = false;
+            powerOnSoundPlayed = false;
+        }
+    }
+    
+    void completePowerToggle() {
+        isPowered = !isPowered;
+        cpu.setPowered(isPowered);
+        if (isPowered) {
+            statusBar = "ONLINE";
+            appendOutput("System ready. Type program above and press F5 to run.\n");
+            showEditor = true;
+            if (editor.empty()) {
+                editor = "; Welcome to CPU-16\n";
+                editor += "; Write your program here\n";
+                editor += "MOV AX 0x002A\n";
+                editor += "MOV BX 0x0008\n";
+                editor += "ADD AX BX\n";
+                editor += "OUT 1 AX\n";
+                editor += "HLT\n";
+            }
+            updateEditorLines();
+        } else {
+            statusBar = "OFFLINE";
+            showEditor = false;
+            audio.stopPowerOn();
+        }
+        animating = false;
+        booting = false;
     }
 
     void runProgram() {
-        status = "EXECUTING";
-        cpu.setDebug(true);
-        ostringstream captured;
-        streambuf* oldBuffer = cout.rdbuf(captured.rdbuf());
-        cpu.executeProgram(editor);
-        cout.rdbuf(oldBuffer);
-        appendLog("[EXEC] PROGRAM FINISHED");
-        appendLog(captured.str());
-        status = "ONLINE";
+        if (!isPowered) {
+            appendOutput("ERROR: System is powered off\n");
+            return;
+        }
+        if (editor.empty()) {
+            appendOutput("ERROR: No program to run\n");
+            return;
+        }
+        
+        statusBar = "EXECUTING";
+        string result = cpu.executeProgram(editor);
+        appendOutput("\n=== PROGRAM OUTPUT ===\n");
+        appendOutput(result);
+        appendOutput("=== END OF OUTPUT ===\n");
+        statusBar = "ONLINE";
     }
 
     void resetMachine() {
+        if (!isPowered) {
+            appendOutput("ERROR: System is powered off\n");
+            return;
+        }
         disk.reset();
         cpu.reset();
-        status = "RESET COMPLETE";
-        appendLog("[SYSTEM] CPU, CACHE AND VIRTUAL DISK RESET.");
+        appendOutput("System reset complete\n");
+    }
+    
+    void updateEditorLines() {
+        editorLines.clear();
+        istringstream iss(editor);
+        string line;
+        while (getline(iss, line)) {
+            editorLines.push_back(line);
+        }
+        if (editorLines.empty()) editorLines.push_back("");
+        cursorLine = min(cursorLine, (int)editorLines.size() - 1);
+        cursorLine = max(0, cursorLine);
+        cursorCol = min(cursorCol, (int)editorLines[cursorLine].length());
+        cursorCol = max(0, cursorCol);
+    }
+    
+    void insertChar(char c) {
+        if (!isPowered || !showEditor) return;
+        if (c == '\n') {
+            string currentLine = editorLines[cursorLine];
+            string before = currentLine.substr(0, cursorCol);
+            string after = currentLine.substr(cursorCol);
+            editorLines[cursorLine] = before;
+            editorLines.insert(editorLines.begin() + cursorLine + 1, after);
+            cursorLine++;
+            cursorCol = 0;
+        } else {
+            string& line = editorLines[cursorLine];
+            line.insert(cursorCol, 1, c);
+            cursorCol++;
+        }
+        rebuildEditor();
+    }
+    
+    void deleteChar() {
+        if (!isPowered || !showEditor) return;
+        if (cursorCol > 0) {
+            string& line = editorLines[cursorLine];
+            line.erase(cursorCol - 1, 1);
+            cursorCol--;
+        } else if (cursorLine > 0) {
+            string prevLine = editorLines[cursorLine - 1];
+            string currentLine = editorLines[cursorLine];
+            editorLines[cursorLine - 1] = prevLine + currentLine;
+            editorLines.erase(editorLines.begin() + cursorLine);
+            cursorLine--;
+            cursorCol = prevLine.length();
+        }
+        rebuildEditor();
+    }
+    
+    void rebuildEditor() {
+        editor.clear();
+        for (const string& line : editorLines) {
+            editor += line + "\n";
+        }
+        if (!editor.empty() && editor.back() == '\n') {
+            editor.pop_back();
+        }
+    }
+    
+    void moveCursorUp() {
+        if (cursorLine > 0) {
+            cursorLine--;
+            cursorCol = min(cursorCol, (int)editorLines[cursorLine].length());
+        }
+    }
+    
+    void moveCursorDown() {
+        if (cursorLine < (int)editorLines.size() - 1) {
+            cursorLine++;
+            cursorCol = min(cursorCol, (int)editorLines[cursorLine].length());
+        }
+    }
+    
+    void moveCursorLeft() {
+        if (cursorCol > 0) {
+            cursorCol--;
+        } else if (cursorLine > 0) {
+            cursorLine--;
+            cursorCol = editorLines[cursorLine].length();
+        }
+    }
+    
+    void moveCursorRight() {
+        if (cursorCol < (int)editorLines[cursorLine].length()) {
+            cursorCol++;
+        } else if (cursorLine < (int)editorLines.size() - 1) {
+            cursorLine++;
+            cursorCol = 0;
+        }
     }
 
     static void errorCallback(int, const char* description) {
         cerr << "GLFW error: " << description << '\n';
     }
 
-    static void keyCallback(GLFWwindow* window, int key, int, int action, int) {
+    static void keyCallback(GLFWwindow* window, int key, int, int action, int mods) {
         if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
         auto* app = static_cast<TerminalInterface*>(glfwGetWindowUserPointer(window));
         if (!app) return;
-        if (key == GLFW_KEY_ESCAPE || key == GLFW_KEY_F10) glfwSetWindowShouldClose(window, GLFW_TRUE);
-        else if (key == GLFW_KEY_F1) app->showHelp = !app->showHelp;
-        else if (app->showHelp) return;
-        else if (key == GLFW_KEY_F5) app->runProgram();
-        else if (key == GLFW_KEY_F2) app->resetMachine();
-        else if (key == GLFW_KEY_BACKSPACE && !app->editor.empty()) app->editor.pop_back();
-        else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) app->editor += '\n';
+        
+        if (key == GLFW_KEY_F11 || key == GLFW_KEY_P) {
+            app->togglePower();
+            return;
+        }
+        
+        if (!app->isPowered || app->booting) return;
+        
+        if (key == GLFW_KEY_F1) {
+            app->showHelp = !app->showHelp;
+            return;
+        }
+        if (app->showHelp) {
+            if (key == GLFW_KEY_ESCAPE || key == GLFW_KEY_ENTER) app->showHelp = false;
+            return;
+        }
+        
+        if (key == GLFW_KEY_F5) {
+            app->runProgram();
+        } else if (key == GLFW_KEY_F2) {
+            app->resetMachine();
+        } else if (key == GLFW_KEY_F3) {
+            app->appendOutput(app->disk.listFiles());
+        } else if (key == GLFW_KEY_F4) {
+            static int counter = 1;
+            string fname = "file" + to_string(counter++) + ".asm";
+            if (app->disk.createFile(fname)) {
+                app->appendOutput("Created: " + fname + "\n");
+            }
+        } else if (key == GLFW_KEY_F6) {
+            if (app->disk.writeFile(app->editorFileName, app->editor)) {
+                app->appendOutput("Saved: " + app->editorFileName + "\n");
+            } else {
+                app->appendOutput("ERROR: Could not save " + app->editorFileName + "\n");
+            }
+        } else if (key == GLFW_KEY_F7) {
+            string content = app->disk.readFile(app->editorFileName);
+            if (!content.empty()) {
+                app->editor = content;
+                app->updateEditorLines();
+                app->appendOutput("Loaded: " + app->editorFileName + "\n");
+            } else {
+                app->appendOutput("ERROR: File not found: " + app->editorFileName + "\n");
+            }
+        } else if (key == GLFW_KEY_F8) {
+            app->currentDir = app->disk.getCurrentDirectory();
+            app->appendOutput("Current directory: " + app->currentDir + "\n");
+        } else if (key == GLFW_KEY_F9) {
+            string dir = "new_dir";
+            if (app->disk.createDirectory(dir)) {
+                app->appendOutput("Created directory: " + dir + "\n");
+            }
+        } else if (key == GLFW_KEY_F10) {
+            if (!app->isPowered) return;
+            app->appendOutput("Use F11 or P to power off\n");
+        } else if (key == GLFW_KEY_ESCAPE) {
+            // ESC - do nothing special
+        } else if (key == GLFW_KEY_BACKSPACE) {
+            app->deleteChar();
+        } else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) {
+            app->insertChar('\n');
+        } else if (key == GLFW_KEY_UP) {
+            app->moveCursorUp();
+        } else if (key == GLFW_KEY_DOWN) {
+            app->moveCursorDown();
+        } else if (key == GLFW_KEY_LEFT) {
+            app->moveCursorLeft();
+        } else if (key == GLFW_KEY_RIGHT) {
+            app->moveCursorRight();
+        } else if (key == GLFW_KEY_TAB) {
+            app->insertChar(' ');
+            app->insertChar(' ');
+            app->insertChar(' ');
+            app->insertChar(' ');
+        }
     }
 
     static void charCallback(GLFWwindow* window, unsigned int codepoint) {
         auto* app = static_cast<TerminalInterface*>(glfwGetWindowUserPointer(window));
-        if (!app || app->showHelp || codepoint < 32 || codepoint > 126) return;
-        app->editor += static_cast<char>(codepoint);
+        if (!app || app->showHelp || !app->isPowered || app->booting || codepoint < 32 || codepoint > 126) return;
+        app->insertChar(static_cast<char>(codepoint));
     }
-
 
     static const array<uint8_t, 7>& glyph(char c) {
         static const array<uint8_t, 7> empty{};
@@ -557,22 +1138,117 @@ private:
 
     static vector<string> linesFor(const string& value, size_t maxColumns, size_t maxLines) {
         vector<string> lines;
-        istringstream stream(value); string line;
+        istringstream stream(value); 
+        string line;
         while (getline(stream, line) && lines.size() < maxLines) {
+            if (line.empty()) { 
+                lines.push_back(" "); 
+                continue; 
+            }
+            while (!line.empty() && line.back() == ' ') line.pop_back();
             if (line.empty()) { lines.push_back(" "); continue; }
-            while (line.size() > maxColumns && lines.size() < maxLines) { lines.push_back(line.substr(0, maxColumns)); line.erase(0, maxColumns); }
+            
+            while (line.size() > maxColumns && lines.size() < maxLines) {
+                lines.push_back(line.substr(0, maxColumns));
+                line.erase(0, maxColumns);
+            }
             if (lines.size() < maxLines) lines.push_back(line);
         }
         return lines;
     }
 
+    void drawEditor(float x, float y, float maxWidth, float maxHeight, float scale) {
+        if (!showEditor || editorLines.empty()) return;
+        
+        float lineHeight = 9.0f * scale;
+        float charWidth = 6.0f * scale;
+        size_t maxCols = maxWidth / charWidth;
+        size_t maxLines = maxHeight / lineHeight;
+        
+        float numWidth = 60 * scale;
+        int startLine = editorScroll;
+        int endLine = min(startLine + (int)maxLines, (int)editorLines.size());
+        
+        rect(x, y, maxWidth, maxHeight, 0.0f, 0.05f, 0.02f, 0.3f);
+        
+        float lineY = y;
+        for (int i = startLine; i < endLine; i++) {
+            string lineNum = to_string(i + 1);
+            text(x + 2 * scale, lineY, lineNum, scale * 0.7f, 0.3f, 0.5f, 0.3f);
+            
+            string displayLine = editorLines[i];
+            if ((int)displayLine.length() > maxCols) {
+                displayLine = displayLine.substr(0, maxCols);
+            }
+            text(x + numWidth + 2 * scale, lineY, displayLine, scale, 0.4f, 0.95f, 0.55f);
+            lineY += lineHeight;
+        }
+        
+        if (cursorVisible && cursorLine >= startLine && cursorLine < endLine) {
+            float cursorX = x + numWidth + 2 * scale + cursorCol * charWidth;
+            float cursorY = y + (cursorLine - startLine) * lineHeight;
+            rect(cursorX, cursorY, charWidth * 0.6f, lineHeight, 0.5f, 1.0f, 0.5f, 0.7f);
+        }
+    }
+
     void draw(int width, int height) {
+        double currentTime = glfwGetTime();
+        float deltaTime = static_cast<float>(currentTime - lastUpdateTime);
+        lastUpdateTime = currentTime;
+        
+        // Update audio
+        audio.update(deltaTime);
+        
+        // Handle power on sound - запускаем сразу при начале загрузки
+        if (booting && !powerOnSoundPlayed) {
+            audio.playPowerOn();
+            powerOnSoundPlayed = true;
+        }
+        
+        // Handle power off sound
+        if (animating && !isPowered && !powerOffSoundPlayed) {
+            audio.playPowerOff();
+            powerOffSoundPlayed = true;
+        }
+        
+        // Update animations
+        if (animating) {
+            if (isPowered) {
+                powerAnimation -= animationSpeed;
+                if (powerAnimation <= 0.0f) {
+                    powerAnimation = 0.0f;
+                    completePowerToggle();
+                }
+            } else {
+                powerAnimation += animationSpeed;
+                if (powerAnimation >= 1.0f) {
+                    powerAnimation = 1.0f;
+                    completePowerToggle();
+                }
+            }
+        }
+        
+        if (booting && isPowered) {
+            bootProgress += 0.003f;
+            bootMessageTimer += deltaTime;
+            if (bootMessageTimer > 0.8f && bootMessageIndex < (int)bootMessages.size() - 1) {
+                bootMessageIndex++;
+                bootMessageTimer = 0.0f;
+            }
+            if (bootProgress >= 1.0f) {
+                booting = false;
+                completePowerToggle();
+            }
+        }
+
         glViewport(0, 0, width, height);
         glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, width, height, 0, -1, 1);
         glMatrixMode(GL_MODELVIEW); glLoadIdentity();
 
-        // Desk-like backdrop and a warm, thick CRT enclosure inspired by 1980s terminals.
-        glClearColor(0.055f, 0.035f, 0.022f, 1.0f); glClear(GL_COLOR_BUFFER_BIT);
+        // Background
+        glClearColor(0.055f, 0.035f, 0.022f, 1.0f); 
+        glClear(GL_COLOR_BUFFER_BIT);
+        
         for (int y = 0; y < height; y += 6)
             rect(0, static_cast<float>(y), static_cast<float>(width), 1, 0.12f, 0.075f, 0.035f, 0.22f);
 
@@ -583,57 +1259,152 @@ private:
         const float screenX = caseX + bezel, screenY = caseY + 82 * scale;
         const float screenW = caseW - 2 * bezel, screenH = 500 * scale;
 
-        // Case shadow, cream plastic, bevel and the nearly-black curved-screen approximation.
+        // Case
         rect(caseX + 16 * scale, caseY + 20 * scale, caseW, caseH, 0.025f, 0.014f, 0.008f, 0.72f);
         rect(caseX, caseY, caseW, caseH, 0.62f, 0.47f, 0.28f);
         rect(caseX + 10 * scale, caseY + 10 * scale, caseW - 20 * scale, caseH - 20 * scale, 0.78f, 0.63f, 0.39f);
         rect(screenX - 16 * scale, screenY - 16 * scale, screenW + 32 * scale, screenH + 32 * scale, 0.13f, 0.10f, 0.055f);
         rect(screenX - 7 * scale, screenY - 7 * scale, screenW + 14 * scale, screenH + 14 * scale, 0.025f, 0.035f, 0.026f);
-        rect(screenX, screenY, screenW, screenH, 0.0f, 0.075f, 0.039f);
-        for (int y = static_cast<int>(screenY); y < screenY + screenH; y += max(2, static_cast<int>(4 * scale)))
-            rect(screenX, static_cast<float>(y), screenW, 1, 0.0f, 0.0f, 0.0f, 0.36f);
-        rect(screenX, screenY, screenW, 2 * scale, 0.15f, 0.95f, 0.52f, 0.56f);
+        
+        // Screen
+        float brightness = isPowered ? (1.0f - powerAnimation * 0.5f) : (0.1f + powerAnimation * 0.3f);
+        if (booting) brightness = bootProgress * 0.9f + 0.1f;
+        
+        float screenR = 0.0f * brightness;
+        float screenG = 0.075f * brightness;
+        float screenB = 0.039f * brightness;
+        rect(screenX, screenY, screenW, screenH, screenR, screenG, screenB);
+        
+        if (!isPowered || powerAnimation < 0.3f) {
+            float alpha = isPowered ? 1.0f - powerAnimation * 3.0f : 1.0f;
+            rect(screenX, screenY, screenW, screenH, 0.0f, 0.0f, 0.0f, alpha * 0.8f);
+            
+            string msg = "POWER OFF";
+            if (powerAnimation > 0.3f && !isPowered) msg = "POWERING ON...";
+            if (booting) msg = "BOOTING...";
+            
+            float msgX = screenX + screenW/2 - msg.length() * 3 * scale;
+            float msgY = screenY + screenH/2 - 10 * scale;
+            text(msgX, msgY, msg, 2.0f * scale, 0.3f * brightness, 0.3f * brightness, 0.3f * brightness);
+            
+            if (!isPowered && powerAnimation < 0.5f) {
+                text(screenX + screenW/2 - 100 * scale, screenY + screenH/2 + 20 * scale,
+                     "[F11 or P to power on]", 1.0f * scale, 0.2f, 0.2f, 0.2f);
+            }
+            
+            if (booting) {
+                float barX = screenX + screenW * 0.1f;
+                float barY = screenY + screenH * 0.6f;
+                float barW = screenW * 0.8f;
+                float barH = 8 * scale;
+                
+                rect(barX, barY, barW, barH, 0.1f, 0.1f, 0.1f);
+                rect(barX, barY, barW * bootProgress, barH, 0.2f, 0.8f, 0.2f);
+                
+                int msgIndex = min(bootMessageIndex, (int)bootMessages.size() - 1);
+                text(screenX + screenW/2 - bootMessages[msgIndex].length() * 1.5f * scale, 
+                     barY - 30 * scale, bootMessages[msgIndex], 1.5f * scale, 0.4f, 0.9f, 0.4f);
+            }
+        } else {
+            // Active screen
+            for (int y = static_cast<int>(screenY); y < screenY + screenH; y += max(2, static_cast<int>(4 * scale)))
+                rect(screenX, static_cast<float>(y), screenW, 1, 0.0f, 0.0f, 0.0f, 0.25f);
+            rect(screenX, screenY, screenW, 2 * scale, 0.15f, 0.95f, 0.52f, 0.45f);
 
-        const float terminalScale = max(1.35f, 2.0f * scale);
-        const size_t columns = static_cast<size_t>((screenW - 36 * scale) / (6 * terminalScale));
-        const size_t rows = static_cast<size_t>((screenH - 60 * scale) / (9 * terminalScale));
-        text(screenX + 18 * scale, screenY + 16 * scale,
-             "CPU-16 MICROCOMPUTER  //  MONITOR 1  //  " + status,
-             terminalScale, 0.48f, 1.0f, 0.62f);
-        text(screenX + 18 * scale, screenY + 38 * scale,
-             "PROGRAM.ASM  READY   |   F5 RUN   F2 RESET   F1 HELP   F10 OFF",
-             terminalScale * .83f, 0.26f, 0.72f, 0.39f);
-
-        string display = showHelp
-            ? "*** CPU-16 TERMINAL HELP ***\n\nTYPE ASSEMBLY DIRECTLY AT THE END OF THE PROGRAM.\nBACKSPACE REMOVES A CHARACTER; ENTER STARTS A NEW LINE.\n\nF5   EXECUTE PROGRAM\nF2   RESET CPU, CACHE AND DISK\nF1   RETURN TO TERMINAL\nF10  POWER OFF TERMINAL\n\nNO MOUSE REQUIRED."
-            : editor + "\n> " + log;
-        auto terminalLines = linesFor(display, columns, rows);
-        float y = screenY + 62 * scale;
-        for (const auto& line : terminalLines) {
-            text(screenX + 18 * scale, y, line, terminalScale, 0.38f, 0.95f, 0.51f);
-            y += 9 * terminalScale;
+            const float terminalScale = max(1.1f, 1.6f * scale);
+            
+            text(screenX + 18 * scale, screenY + 16 * scale,
+                 "CPU-16  //  " + statusBar + "  //  " + disk.getCurrentDirectory(),
+                 terminalScale * 0.9f, 0.48f, 1.0f, 0.62f);
+            
+            text(screenX + 18 * scale, screenY + 38 * scale,
+                 "F5 RUN  F2 RESET  F3 DIR  F4 NEW  F6 SAVE  F7 LOAD  F1 HELP  F11 POWER",
+                 terminalScale * 0.7f, 0.26f, 0.72f, 0.39f);
+            
+            float contentY = screenY + 58 * scale;
+            float contentH = screenH - 100 * scale;
+            
+            float editorH = contentH * 0.6f;
+            float outputH = contentH * 0.4f;
+            
+            if (showHelp) {
+                string help = 
+                    "=== CPU-16 HELP ===\n\n"
+                    "F5     Run program\n"
+                    "F2     Reset system\n"
+                    "F3     List directory\n"
+                    "F4     Create new file\n"
+                    "F6     Save to program.asm\n"
+                    "F7     Load program.asm\n"
+                    "F8     Show current directory\n"
+                    "F9     Create new directory\n"
+                    "F11/P  Toggle power\n"
+                    "F1     Toggle help\n"
+                    "ESC    Close help\n\n"
+                    "Arrow keys to navigate\n"
+                    "Type to edit program";
+                auto helpLines = linesFor(help, 60, 30);
+                float y = contentY + 10 * scale;
+                for (const auto& line : helpLines) {
+                    text(screenX + 20 * scale, y, line, terminalScale, 0.5f, 1.0f, 0.6f);
+                    y += 9 * terminalScale;
+                }
+            } else {
+                // Editor area
+                rect(screenX + 10 * scale, contentY, screenW - 20 * scale, editorH, 0.0f, 0.03f, 0.01f, 0.5f);
+                drawEditor(screenX + 10 * scale, contentY + 2 * scale, 
+                          screenW - 20 * scale, editorH - 4 * scale, terminalScale * 0.8f);
+                
+                // Separator
+                rect(screenX + 10 * scale, contentY + editorH, screenW - 20 * scale, 2 * scale, 0.2f, 0.6f, 0.2f, 0.5f);
+                
+                // Output area
+                float outputY = contentY + editorH + 4 * scale;
+                rect(screenX + 10 * scale, outputY, screenW - 20 * scale, outputH - 4 * scale, 0.0f, 0.02f, 0.01f, 0.5f);
+                
+                string displayOutput = outputBuffer;
+                if (displayOutput.length() > 500) {
+                    size_t pos = displayOutput.find('\n', displayOutput.length() - 500);
+                    if (pos != string::npos) displayOutput = displayOutput.substr(pos + 1);
+                }
+                auto outLines = linesFor(displayOutput, 80, 20);
+                float lineY = outputY + 2 * scale;
+                for (const auto& line : outLines) {
+                    text(screenX + 14 * scale, lineY, line, terminalScale * 0.7f, 0.4f, 0.8f, 0.4f);
+                    lineY += 8 * terminalScale;
+                }
+            }
         }
-        if (!showHelp && cursorVisible && terminalLines.size() < rows)
-            text(screenX + 18 * scale, y, "_", terminalScale, 0.70f, 1.0f, 0.70f);
 
-        // Physical terminal details: maker plate, vents, power lamp, and keyboard-only legend.
+        // Physical details
         rect(caseX + 34 * scale, caseY + caseH - 120 * scale, 250 * scale, 42 * scale, 0.48f, 0.35f, 0.20f);
         text(caseX + 48 * scale, caseY + caseH - 107 * scale, "A R C A D E  1 6", 1.3f * scale, 0.12f, 0.09f, 0.05f);
         text(caseX + 48 * scale, caseY + caseH - 91 * scale, "PERSONAL COMPUTER", 0.85f * scale, 0.12f, 0.09f, 0.05f);
         for (int i = 0; i < 5; ++i)
             rect(caseX + 38 * scale + i * 10 * scale, caseY + caseH - 55 * scale, 6 * scale, 3 * scale, 0.18f, 0.13f, 0.07f);
+        
+        // Power LED
+        float ledBrightness = isPowered ? 1.0f : 0.2f;
         rect(caseX + caseW - 104 * scale, caseY + caseH - 108 * scale, 52 * scale, 26 * scale, 0.18f, 0.13f, 0.07f);
-        rect(caseX + caseW - 97 * scale, caseY + caseH - 101 * scale, 12 * scale, 12 * scale, 0.22f, 0.95f, 0.31f);
+        rect(caseX + caseW - 97 * scale, caseY + caseH - 101 * scale, 12 * scale, 12 * scale, 
+             0.22f * ledBrightness, 0.95f * ledBrightness, 0.31f * ledBrightness);
+        rect(caseX + caseW - 100 * scale, caseY + caseH - 104 * scale, 18 * scale, 18 * scale,
+             0.15f * ledBrightness, 0.5f * ledBrightness, 0.2f * ledBrightness, 0.3f);
         text(caseX + caseW - 166 * scale, caseY + caseH - 68 * scale, "POWER", 0.9f * scale, 0.18f, 0.13f, 0.07f);
 
+        // Footer
         rect(caseX + 122 * scale, caseY + caseH + 12 * scale, caseW - 244 * scale, 54 * scale, 0.43f, 0.32f, 0.19f);
         text(caseX + 150 * scale, caseY + caseH + 30 * scale,
-             "[F5] RUN     [F2] REBOOT     [F1] HELP     [F10] POWER OFF",
+             "[F11/P] POWER  [F5] RUN  [F2] RESET  [F1] HELP",
              1.35f * scale, 0.76f, 0.64f, 0.40f);
     }
 
 public:
-    TerminalInterface() : cpu(&disk) {}
+    TerminalInterface() : cpu(&disk) {
+        fs::path exePath(getExecutablePath());
+        editorFileName = (exePath / "program.asm").string();
+        updateEditorLines();
+    }
 
     int run() {
         glfwSetErrorCallback(errorCallback);
@@ -651,18 +1422,55 @@ public:
         glfwSetWindowUserPointer(window, this);
         glfwSetKeyCallback(window, keyCallback);
         glfwSetCharCallback(window, charCallback);
+        
+        // Initial state: powered off
+        isPowered = false;
+        cpu.setPowered(false);
+        statusBar = "OFFLINE";
+        powerAnimation = 0.0f;
+        animating = false;
+        booting = false;
+        showEditor = false;
+        powerOnSoundPlayed = false;
+        powerOffSoundPlayed = false;
+        
         while (!glfwWindowShouldClose(window)) {
             const double now = glfwGetTime();
-            if (now - lastBlink > 0.55) { cursorVisible = !cursorVisible; lastBlink = now; }
-            int width, height; glfwGetFramebufferSize(window, &width, &height);
-            draw(width, height); glfwSwapBuffers(window); glfwPollEvents();
+            if (now - lastBlink > 0.55) { 
+                cursorVisible = !cursorVisible; 
+                lastBlink = now; 
+            }
+            int width, height; 
+            glfwGetFramebufferSize(window, &width, &height);
+            draw(width, height); 
+            glfwSwapBuffers(window); 
+            glfwPollEvents();
         }
-        glfwDestroyWindow(window); glfwTerminate();
+        glfwDestroyWindow(window); 
+        glfwTerminate();
         return 0;
     }
 };
 
 int main() {
+    cout << "Executable path: " << getExecutablePath() << "\n";
+    cout << "Sounds path: " << getSoundsPath() << "\n";
+    
+    // List files in sounds directory
+    string soundsPath = getSoundsPath();
+    fs::path sp(soundsPath);
+    if (fs::exists(sp)) {
+        cout << "Files in sounds directory:\n";
+        for (const auto& entry : fs::directory_iterator(sp)) {
+            cout << "  " << entry.path().filename().string() << "\n";
+        }
+    } else {
+        cout << "Sounds directory does not exist!\n";
+        if (fs::create_directory(sp)) {
+            cout << "Created sounds directory\n";
+        }
+    }
+    
     TerminalInterface terminal;
     return terminal.run();
 }
