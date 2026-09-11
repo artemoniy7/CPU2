@@ -463,6 +463,17 @@ public:
         }
     }
 
+    // Raw sector access is intentionally bounded to the data region so programs
+    // cannot overwrite the filesystem manifest at the end of the virtual disk.
+    uint8_t readSectorByte(uint32_t lba, uint16_t offset) const {
+        const size_t pos = static_cast<size_t>(lba) * 512 + offset;
+        return pos < DATA_LIMIT ? data[pos] : 0;
+    }
+    bool writeSectorByte(uint32_t lba, uint16_t offset, uint8_t value) {
+        const size_t pos = static_cast<size_t>(lba) * 512 + offset;
+        if (pos >= DATA_LIMIT) return false;
+        data[pos] = value; saveToDisk(); return true;
+    }
     void* getData() { return data.data(); }
     size_t getSize() const { return SIZE; }
 };
@@ -595,7 +606,6 @@ private:
     uint16_t IP = 0;
 
     bool ZF=false, CF=false, SF=false, OF=false, DF=false;
-    stack<uint16_t> callStack;
 
     struct CacheLine { bool valid=false; uint32_t tag=0; uint8_t data[64]; };
     static const int CACHE_SIZE = 8;
@@ -603,6 +613,9 @@ private:
 
     VirtualDisk* disk;
     vector<uint8_t> ram = vector<uint8_t>(1024 * 1024, 0);
+    // Read-only 64 KiB firmware mapped at F000:0000 (physical F0000).
+    array<uint8_t, 64 * 1024> biosRom{};
+    bool postPassed = false;
     bool debugMode = false;
     bool powered = false;
     string loadedSource;
@@ -612,10 +625,32 @@ private:
     bool waitingForTerminalInput = false;
     uint16_t waitingInputPort = 0;
     uint16_t lastKeyScanCode = 0;
+    // Disk controller registers: sector LBA and byte cursor for port-based I/O.
+    uint32_t diskLba = 0;
+    uint16_t diskCursor = 0;
+    uint8_t diskStatus = 0;
+
+    uint32_t physicalAddress(uint16_t segment, uint16_t offset) const {
+        return (static_cast<uint32_t>(segment) << 4) + offset;
+    }
+    uint16_t flagsWord() const {
+        return (CF ? 0x0001 : 0) | (ZF ? 0x0040 : 0) | (SF ? 0x0080 : 0) |
+               (DF ? 0x0400 : 0) | (OF ? 0x0800 : 0);
+    }
+    void restoreFlags(uint16_t flags) {
+        CF = flags & 0x0001; ZF = flags & 0x0040; SF = flags & 0x0080;
+        DF = flags & 0x0400; OF = flags & 0x0800;
+    }
+    void pushWord(uint16_t value) { SP -= 2; writeWord(physicalAddress(SS, SP), value); }
+    uint16_t popWord() { uint16_t value = readWord(physicalAddress(SS, SP)); SP += 2; return value; }
     chrono::steady_clock::time_point startedAt = chrono::steady_clock::now();
 
 public:
-    CPU(VirtualDisk* d) : disk(d) {}
+    CPU(VirtualDisk* d) : disk(d) {
+        const string banner = "CPU16 BIOS 1.0";
+        copy(banner.begin(), banner.end(), biosRom.begin());
+        postPassed = true; // RAM/cache/firmware structures are initialized above.
+    }
 
     void setDebug(bool on) { debugMode = on; }
     void setPowered(bool on) { powered = on; }
@@ -638,13 +673,13 @@ public:
     }
 
     void reset() {
-        AX=BX=CX=DX=SP=BP=SI=DI=CS=DS=SS=ES=IP=0;
+        AX=BX=CX=DX=BP=SI=DI=CS=DS=SS=ES=IP=0; SP=0xFFFE;
         ZF=CF=SF=OF=DF=false;
-        while(!callStack.empty()) callStack.pop();
         for(auto& line : cache) line.valid = false;
         fill(ram.begin(), ram.end(), 0);
         stopProgram();
         startedAt = chrono::steady_clock::now();
+        postPassed = true;
     }
 
     uint8_t readByte(uint32_t addr) {
@@ -657,8 +692,12 @@ public:
         int idx = addr % CACHE_SIZE;
         cache[idx].valid = true;
         cache[idx].tag = tag;
-        for (size_t i = 0; i < 64; i++)
-            cache[idx].data[i] = (tag * 64 + i < ram.size()) ? ram[tag * 64 + i] : 0;
+        for (size_t i = 0; i < 64; i++) {
+            const uint32_t physical = tag * 64 + i;
+            cache[idx].data[i] = physical >= 0xF0000 && physical < 0x100000
+                ? biosRom[physical - 0xF0000]
+                : (physical < ram.size() ? ram[physical] : 0);
+        }
         return cache[idx].data[offset];
     }
 
@@ -668,7 +707,7 @@ public:
     }
 
     void writeByte(uint32_t addr, uint8_t val) {
-        if (!powered) return;
+        if (!powered || (addr >= 0xF0000 && addr < 0x100000)) return;
         uint32_t tag = addr / 64, offset = addr % 64;
         for (int i = 0; i < CACHE_SIZE; i++)
             if (cache[i].valid && cache[i].tag == tag) {
@@ -753,13 +792,11 @@ public:
             }
             else if (opcode == "PUSH") {
                 string src; cmdStream >> src;
-                SP -= 2;
-                writeWord(SP, getValue(src));
+                pushWord(getValue(src));
             }
             else if (opcode == "POP") {
                 string dest; cmdStream >> dest;
-                uint16_t val = readWord(SP);
-                SP += 2;
+                uint16_t val = popWord();
                 setRegister(dest, val);
             }
             else if (opcode == "ADD" || opcode == "SUB" || opcode == "CMP") {
@@ -807,12 +844,12 @@ public:
             }
             else if (opcode == "LOAD") {
                 string dest, addr; cmdStream >> dest >> addr;
-                uint16_t val = readWord(getValue(addr));
+                uint16_t val = readWord(physicalAddress(DS, getValue(addr)));
                 setRegister(dest, val);
             }
             else if (opcode == "STORE") {
                 string src, addr; cmdStream >> src >> addr;
-                writeWord(getValue(addr), getRegister(src));
+                writeWord(physicalAddress(DS, getValue(addr)), getRegister(src));
             }
             else if (opcode == "IN") {
                 string dest, port; cmdStream >> dest >> port;
@@ -829,7 +866,10 @@ public:
                 else if (portNumber == 0x02) val = static_cast<uint8_t>(terminalInput[0]);
                 else if (portNumber == 0x10) val = static_cast<uint16_t>(chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - startedAt).count());
                 else if (portNumber == 0x20) val = lastKeyScanCode;
-                else if (portNumber == 0x30) val = 0;
+                else if (portNumber == 0x30) val = disk->readSectorByte(diskLba, diskCursor++);
+                else if (portNumber == 0x31) val = diskStatus;
+                else if (portNumber == 0x32) val = static_cast<uint16_t>(diskLba & 0xFFFF);
+                else if (portNumber == 0x33) val = static_cast<uint16_t>(diskLba >> 16);
                 output << "IN 0x" << hex << portNumber << " -> 0x" << val << "\n";
                 setRegister(dest, val);
                 if (portNumber == 0x00 || portNumber == 0x02) terminalInput.clear();
@@ -839,17 +879,21 @@ public:
                 uint16_t portNumber = getValue(port), val = getValue(src);
                 if (portNumber == 0x01) output << dec << val << "\n";
                 else if (portNumber == 0x03 || portNumber == 0xE9) output << static_cast<char>(val & 0xFF);
+                else if (portNumber == 0x30) { diskStatus = disk->writeSectorByte(diskLba, diskCursor++, val & 0xFF) ? 0 : 1; }
+                else if (portNumber == 0x31) { if (val == 0) { diskCursor = 0; diskStatus = 0; } else diskStatus = 1; }
+                else if (portNumber == 0x32) diskLba = (diskLba & 0xFFFF0000U) | val;
+                else if (portNumber == 0x33) diskLba = (diskLba & 0x0000FFFFU) | (static_cast<uint32_t>(val) << 16);
                 else output << "OUT 0x" << hex << portNumber << " = 0x" << val << " (" << dec << val << ")\n";
             }
             else if (opcode == "PEEK") {
                 string addr; cmdStream >> addr;
-                uint16_t val = readByte(getValue(addr));
+                uint16_t val = readByte(physicalAddress(DS, getValue(addr)));
                 output << "0x" << hex << setw(4) << setfill('0') << getValue(addr)
                        << " = 0x" << setw(2) << (int)val << "\n";
             }
             else if (opcode == "POKE") {
                 string addr, val; cmdStream >> addr >> val;
-                writeByte(getValue(addr), getValue(val) & 0xFF);
+                writeByte(physicalAddress(DS, getValue(addr)), getValue(val) & 0xFF);
             }
             else if (opcode == "DUMP") {
                 string addr, len; cmdStream >> addr >> len;
@@ -891,6 +935,25 @@ public:
                     }
                 }
             }
+            else if (opcode == "INT") {
+                string vectorText; cmdStream >> vectorText;
+                const uint8_t vector = static_cast<uint8_t>(getValue(vectorText));
+                // Firmware services are synchronous software interrupts.  They preserve
+                // the unified RAM stack convention while avoiding host-side callbacks.
+                // CPU pushes FLAGS, CS and the return IP exactly as an interrupt gate.
+                pushWord(flagsWord()); pushWord(CS); pushWord(IP);
+                if (vector == 0x10) output << static_cast<char>(AX & 0xFF);
+                else if (vector == 0x11) AX = lastKeyScanCode;
+                else if (vector == 0x13) { diskLba = (static_cast<uint32_t>(CX) << 16) | DX; diskCursor = 0; diskStatus = 0; }
+                else if (vector == 0x19) { IP = programLines.size(); output << "Boot service invoked\n"; }
+                else { output << "Unhandled interrupt 0x" << hex << static_cast<int>(vector) << "\n"; }
+                // Firmware handlers end with IRET; model that return before next instruction.
+                const uint16_t returnIp = popWord(), returnCs = popWord(), returnFlags = popWord();
+                if (vector != 0x19) { IP = returnIp; CS = returnCs; restoreFlags(returnFlags); }
+            }
+            else if (opcode == "IRET") {
+                IP = popWord(); CS = popWord(); restoreFlags(popWord());
+            }
             else if (opcode == "CLC") { CF = false; }
             else if (opcode == "STC") { CF = true; }
             else if (opcode == "CMC") { CF = !CF; }
@@ -922,12 +985,12 @@ public:
             else if (opcode == "CALL") {
                 string label; cmdStream >> label;
                 if (programLabels.count(label)) {
-                    callStack.push(IP);
+                    pushWord(IP);
                     IP = programLabels[label];
                 } else { output << "Label " << label << " not found\n"; return output.str(); }
             }
             else if (opcode == "RET") {
-                if (!callStack.empty()) { IP = callStack.top(); callStack.pop(); }
+                if (SP != 0xFFFE) { IP = popWord(); }
                 else { output << "RET without CALL\n"; return output.str(); }
             }
             else if (opcode == "LOOP") {
@@ -964,7 +1027,8 @@ private:
             }
         }
         if (arg == "AX" || arg == "BX" || arg == "CX" || arg == "DX" ||
-            arg == "SP" || arg == "BP" || arg == "SI" || arg == "DI") {
+            arg == "SP" || arg == "BP" || arg == "SI" || arg == "DI" ||
+            arg == "CS" || arg == "DS" || arg == "SS" || arg == "ES") {
             return getRegister(arg);
         }
         if (arg[0] == '0' && (arg[1] == 'x' || arg[1] == 'X')) {
@@ -982,6 +1046,10 @@ private:
         if (reg == "BP") return BP;
         if (reg == "SI") return SI;
         if (reg == "DI") return DI;
+        if (reg == "CS") return CS;
+        if (reg == "DS") return DS;
+        if (reg == "SS") return SS;
+        if (reg == "ES") return ES;
         return 0;
     }
 
@@ -990,6 +1058,8 @@ private:
         if (reg == "CX") { CX = val; return; } if (reg == "DX") { DX = val; return; }
         if (reg == "SP") { SP = val; return; } if (reg == "BP") { BP = val; return; }
         if (reg == "SI") { SI = val; return; } if (reg == "DI") { DI = val; return; }
+        if (reg == "CS") { CS = val; return; } if (reg == "DS") { DS = val; return; }
+        if (reg == "SS") { SS = val; return; } if (reg == "ES") { ES = val; return; }
     }
 };
 
@@ -999,22 +1069,76 @@ private:
 class Asm16Compiler {
 public:
     static constexpr const char* MAGIC = "ASM16EXE1\n";
+    static constexpr const char* BYTECODE_MAGIC = "ASM16BC1";
+
     static bool compile(const string& sourcePath, const string& source, const string& parameters,
                         string& executable, string& error) {
         if (sourcePath.empty() || fs::path(sourcePath).extension() != ".asm") {
             error = "Input path must name an .asm source file"; return false;
         }
         if (source.empty()) { error = "Source file is empty"; return false; }
-        // Parameters are recorded with the executable so the invocation is reproducible.
-        executable = string(MAGIC) + "; asm16 " + sourcePath + " " + parameters + "\n" + source;
-        error.clear();
-        return true;
+        (void)parameters;
+        const unordered_map<string, uint8_t> opcodes = {
+            {"MOV",1},{"XCHG",2},{"PUSH",3},{"POP",4},{"ADD",5},{"SUB",6},{"CMP",7},
+            {"INC",8},{"DEC",9},{"NEG",10},{"MUL",11},{"IMUL",12},{"DIV",13},{"IDIV",14},
+            {"LOAD",15},{"STORE",16},{"IN",17},{"OUT",18},{"PEEK",19},{"POKE",20},{"DUMP",21},
+            {"PRINT",22},{"CLC",23},{"STC",24},{"CMC",25},{"CLD",26},{"STD",27},{"NOP",28},
+            {"HLT",29},{"JMP",30},{"JE",31},{"JZ",32},{"JNE",33},{"JNZ",34},{"JG",35},{"JL",36},
+            {"CALL",37},{"RET",38},{"LOOP",39},{"INT",40},{"IRET",41}
+        };
+        ostringstream bytecode;
+        bytecode.write(BYTECODE_MAGIC, 8);
+        // The compiler emits a length-prefixed instruction stream, not source text.
+        // Labels are explicit records so the executor can reconstruct its symbol table.
+        istringstream input(source); string line; size_t lineNo = 0;
+        while (getline(input, line)) {
+            ++lineNo;
+            const size_t comment = line.find(';'); if (comment != string::npos) line.erase(comment);
+            const size_t first = line.find_first_not_of(" \t"); if (first == string::npos) continue;
+            line = line.substr(first); const size_t last = line.find_last_not_of(" \t"); line.erase(last + 1);
+            if (line.back() == ':') {
+                string label = line.substr(0, line.size() - 1);
+                if (label.empty() || label.size() > 255) { error = "Invalid label on line " + to_string(lineNo); return false; }
+                bytecode.put(0); bytecode.put(static_cast<char>(label.size())); bytecode.write(label.data(), label.size());
+                continue;
+            }
+            istringstream instruction(line); string opcode; instruction >> opcode;
+            transform(opcode.begin(), opcode.end(), opcode.begin(), [](unsigned char c){ return static_cast<char>(toupper(c)); });
+            auto op = opcodes.find(opcode);
+            if (op == opcodes.end()) { error = "Unknown instruction on line " + to_string(lineNo) + ": " + opcode; return false; }
+            string operands; getline(instruction, operands); const size_t operandStart = operands.find_first_not_of(" \t");
+            operands = operandStart == string::npos ? "" : operands.substr(operandStart);
+            if (operands.size() > 65535) { error = "Instruction too long on line " + to_string(lineNo); return false; }
+            bytecode.put(static_cast<char>(op->second));
+            const uint16_t length = static_cast<uint16_t>(operands.size());
+            bytecode.put(static_cast<char>(length & 0xFF)); bytecode.put(static_cast<char>(length >> 8));
+            bytecode.write(operands.data(), operands.size());
+        }
+        executable = string(MAGIC) + BYTECODE_MAGIC + bytecode.str().substr(8);
+        error.clear(); return true;
     }
     static bool readExecutable(const string& executable, string& source) {
-        const string magic(MAGIC);
-        if (executable.rfind(magic, 0) != 0) return false;
-        source = executable.substr(magic.size());
-        return true;
+        const string header = string(MAGIC) + BYTECODE_MAGIC;
+        if (executable.rfind(header, 0) != 0) return false;
+        const unordered_map<uint8_t, string> names = {
+            {1,"MOV"},{2,"XCHG"},{3,"PUSH"},{4,"POP"},{5,"ADD"},{6,"SUB"},{7,"CMP"},{8,"INC"},{9,"DEC"},{10,"NEG"},{11,"MUL"},{12,"IMUL"},{13,"DIV"},{14,"IDIV"},{15,"LOAD"},{16,"STORE"},{17,"IN"},{18,"OUT"},{19,"PEEK"},{20,"POKE"},{21,"DUMP"},{22,"PRINT"},{23,"CLC"},{24,"STC"},{25,"CMC"},{26,"CLD"},{27,"STD"},{28,"NOP"},{29,"HLT"},{30,"JMP"},{31,"JE"},{32,"JZ"},{33,"JNE"},{34,"JNZ"},{35,"JG"},{36,"JL"},{37,"CALL"},{38,"RET"},{39,"LOOP"},{40,"INT"},{41,"IRET"}};
+        source.clear(); size_t pos = header.size();
+        while (pos < executable.size()) {
+            const uint8_t opcode = static_cast<uint8_t>(executable[pos++]);
+            if (opcode == 0) {
+                if (pos >= executable.size()) return false;
+                const size_t len = static_cast<uint8_t>(executable[pos++]);
+                if (pos + len > executable.size()) return false;
+                source += executable.substr(pos, len) + ":\n";
+                pos += len;
+                continue;
+            }
+            if (pos + 2 > executable.size() || !names.count(opcode)) return false;
+            const size_t len = static_cast<uint8_t>(executable[pos]) | (static_cast<size_t>(static_cast<uint8_t>(executable[pos + 1])) << 8); pos += 2;
+            if (pos + len > executable.size()) return false;
+            source += names.at(opcode); if (len) source += " " + executable.substr(pos, len); source += "\n"; pos += len;
+        }
+        return !source.empty();
     }
 };
 
@@ -1396,6 +1520,17 @@ private:
         cerr << "GLFW error: " << description << '\n';
     }
 
+    static uint16_t set1ScanCode(int key) {
+        // GLFW is an input API; expose PC/AT Set 1 make codes to guest programs.
+        if (key >= GLFW_KEY_A && key <= GLFW_KEY_Z) {
+            static constexpr uint8_t codes[] = {0x1E,0x30,0x2E,0x20,0x12,0x21,0x22,0x23,0x17,0x24,0x25,0x26,0x32,0x31,0x18,0x19,0x10,0x13,0x1F,0x14,0x16,0x2F,0x11,0x2D,0x15,0x2C};
+            return codes[key - GLFW_KEY_A];
+        }
+        if (key >= GLFW_KEY_1 && key <= GLFW_KEY_9) { static constexpr uint8_t codes[] = {0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A}; return codes[key - GLFW_KEY_1]; }
+        if (key == GLFW_KEY_0) return 0x0B;
+        switch (key) { case GLFW_KEY_ENTER: return 0x1C; case GLFW_KEY_ESCAPE: return 0x01; case GLFW_KEY_BACKSPACE: return 0x0E; case GLFW_KEY_TAB: return 0x0F; case GLFW_KEY_SPACE: return 0x39; case GLFW_KEY_LEFT: return 0x4B; case GLFW_KEY_RIGHT: return 0x4D; case GLFW_KEY_UP: return 0x48; case GLFW_KEY_DOWN: return 0x50; default: return 0; }
+    }
+
     static void keyCallback(GLFWwindow* window, int key, int, int action, int mods) {
         if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
         auto* app = static_cast<TerminalInterface*>(glfwGetWindowUserPointer(window));
@@ -1403,7 +1538,7 @@ private:
 
         if (key == GLFW_KEY_F11) { app->togglePower(); return; }
         if (!app->isPowered || app->booting) return;
-        app->cpu.setLastKeyScanCode(static_cast<uint16_t>(key));
+        app->cpu.setLastKeyScanCode(set1ScanCode(key));
         if (app->prompt != Prompt::None) {
             if (key == GLFW_KEY_ESCAPE) { app->prompt = Prompt::None; return; }
             if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) { app->finishPrompt(); return; }
@@ -1767,6 +1902,8 @@ private:
                     "OPEN asm16.exe: compile <source.asm> [-o <program.exe>]\n"
                     "OPEN a program .exe: run it to completion\n"
                     "F8     Set terminal input ports 0x00 / 0x02\n"
+                    "DISK: ports 30 DATA, 31 RESET/STATUS, 32/33 LBA\n"
+                    "INT 10 video, INT 11 keyboard, INT 13 disk select\n"
                     "F2     Reset system\n"
                     "F3     List directory\n"
                     "F4     Create new file\n"
