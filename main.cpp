@@ -463,6 +463,17 @@ public:
         }
     }
 
+    // Raw sector access is intentionally bounded to the data region so programs
+    // cannot overwrite the filesystem manifest at the end of the virtual disk.
+    uint8_t readSectorByte(uint32_t lba, uint16_t offset) const {
+        const size_t pos = static_cast<size_t>(lba) * 512 + offset;
+        return pos < DATA_LIMIT ? data[pos] : 0;
+    }
+    bool writeSectorByte(uint32_t lba, uint16_t offset, uint8_t value) {
+        const size_t pos = static_cast<size_t>(lba) * 512 + offset;
+        if (pos >= DATA_LIMIT) return false;
+        data[pos] = value; saveToDisk(); return true;
+    }
     void* getData() { return data.data(); }
     size_t getSize() const { return SIZE; }
 };
@@ -594,8 +605,7 @@ private:
     uint16_t CS=0, DS=0, SS=0, ES=0;
     uint16_t IP = 0;
 
-    bool ZF=false, CF=false, SF=false, OF=false, DF=false;
-    stack<uint16_t> callStack;
+    bool ZF=false, CF=false, SF=false, OF=false, DF=false, IF=true;
 
     struct CacheLine { bool valid=false; uint32_t tag=0; uint8_t data[64]; };
     static const int CACHE_SIZE = 8;
@@ -603,6 +613,9 @@ private:
 
     VirtualDisk* disk;
     vector<uint8_t> ram = vector<uint8_t>(1024 * 1024, 0);
+    // Read-only 64 KiB firmware mapped at F000:0000 (physical F0000).
+    array<uint8_t, 64 * 1024> biosRom{};
+    bool postPassed = false;
     bool debugMode = false;
     bool powered = false;
     string loadedSource;
@@ -612,10 +625,32 @@ private:
     bool waitingForTerminalInput = false;
     uint16_t waitingInputPort = 0;
     uint16_t lastKeyScanCode = 0;
+    // Disk controller registers: sector LBA and byte cursor for port-based I/O.
+    uint32_t diskLba = 0;
+    uint16_t diskCursor = 0;
+    uint8_t diskStatus = 0;
+
+    uint32_t physicalAddress(uint16_t segment, uint16_t offset) const {
+        return (static_cast<uint32_t>(segment) << 4) + offset;
+    }
+    uint16_t flagsWord() const {
+        return (CF ? 0x0001 : 0) | (ZF ? 0x0040 : 0) | (SF ? 0x0080 : 0) |
+               (DF ? 0x0400 : 0) | (OF ? 0x0800 : 0);
+    }
+    void restoreFlags(uint16_t flags) {
+        CF = flags & 0x0001; ZF = flags & 0x0040; SF = flags & 0x0080;
+        DF = flags & 0x0400; OF = flags & 0x0800;
+    }
+    void pushWord(uint16_t value) { SP -= 2; writeWord(physicalAddress(SS, SP), value); }
+    uint16_t popWord() { uint16_t value = readWord(physicalAddress(SS, SP)); SP += 2; return value; }
     chrono::steady_clock::time_point startedAt = chrono::steady_clock::now();
 
 public:
-    CPU(VirtualDisk* d) : disk(d) {}
+    CPU(VirtualDisk* d) : disk(d) {
+        const string banner = "CPU16 BIOS 1.0";
+        copy(banner.begin(), banner.end(), biosRom.begin());
+        postPassed = true; // RAM/cache/firmware structures are initialized above.
+    }
 
     void setDebug(bool on) { debugMode = on; }
     void setPowered(bool on) { powered = on; }
@@ -624,8 +659,107 @@ public:
     bool isWaitingForTerminalInput() const { return waitingForTerminalInput; }
     uint16_t getWaitingInputPort() const { return waitingInputPort; }
     void setLastKeyScanCode(uint16_t code) { lastKeyScanCode = code; }
-    void stopProgram() { loadedSource.clear(); programLines.clear(); programLabels.clear(); IP = 0; waitingForTerminalInput = false; }
-    bool hasProgram() const { return !programLines.empty() && IP < programLines.size(); }
+    void stopProgram() { loadedSource.clear(); programLines.clear(); programLabels.clear(); bytecode.clear(); bytecodeActive = false; halted = true; IP = 0; waitingForTerminalInput = false; }
+    bool hasProgram() const { return bytecodeActive ? !halted : (!programLines.empty() && IP < programLines.size()); }
+
+    // Native executable state.  An instruction is exactly seven bytes:
+    // opcode, operand-A type/value, operand-B type/value.  IP is a byte offset.
+    vector<uint8_t> bytecode;
+    uint16_t bytecodeBase = 0x0100;
+    bool bytecodeActive = false;
+    bool halted = false;
+    bool keyboardIrqPending = false, timerIrqPending = false;
+    vector<uint16_t> breakpoints;
+
+    void loadBytecode(const vector<uint8_t>& code, uint16_t entryPoint, uint16_t loadAddress = 0x0100) {
+        bytecode = code; bytecodeBase = loadAddress; IP = entryPoint; bytecodeActive = true;
+        halted = false; waitingForTerminalInput = false;
+        for (size_t i = 0; i < code.size() && loadAddress + i < ram.size(); ++i) ram[loadAddress + i] = code[i];
+    }
+    uint16_t instructionPointer() const { return IP; }
+    void setInterruptVector(uint8_t vector, uint16_t offset, uint16_t segment) {
+        const uint16_t address = static_cast<uint16_t>(vector) * 4;
+        ram[address] = offset & 0xFF; ram[address + 1] = offset >> 8;
+        ram[address + 2] = segment & 0xFF; ram[address + 3] = segment >> 8;
+    }
+    void raiseKeyboardIRQ() { keyboardIrqPending = true; }
+    void raiseTimerIRQ() { timerIrqPending = true; }
+    bool dispatchPendingIRQ() {
+        if (!IF || !bytecodeActive) return false;
+        const uint8_t vector = keyboardIrqPending ? 0x09 : timerIrqPending ? 0x08 : 0;
+        if (!vector) return false;
+        keyboardIrqPending = timerIrqPending = false;
+        const uint16_t address = static_cast<uint16_t>(vector) * 4;
+        const uint16_t offset = ram[address] | (static_cast<uint16_t>(ram[address + 1]) << 8);
+        const uint16_t segment = ram[address + 2] | (static_cast<uint16_t>(ram[address + 3]) << 8);
+        if (!offset && !segment) return false; // uninstalled vector: acknowledge only
+        pushWord(flagsWord()); pushWord(CS); pushWord(IP); IF = false; CS = segment; IP = offset;
+        return true;
+    }
+    void addBreakpoint(uint16_t address) { if (find(breakpoints.begin(), breakpoints.end(), address) == breakpoints.end()) breakpoints.push_back(address); }
+    void clearBreakpoints() { breakpoints.clear(); }
+    bool atBreakpoint() const { return find(breakpoints.begin(), breakpoints.end(), IP) != breakpoints.end(); }
+    bool isBytecodeActive() const { return bytecodeActive; }
+
+    string step() {
+        ostringstream output;
+        if (!powered || !bytecodeActive || halted) return output.str();
+        dispatchPendingIRQ();
+        if (static_cast<size_t>(IP) + 7 > bytecode.size()) { halted = true; return "Invalid bytecode IP\n"; }
+        const uint8_t opcode = bytecode[IP++];
+        const uint8_t at = bytecode[IP++];
+        const uint16_t avLow = bytecode[IP++], avHigh = bytecode[IP++];
+        const uint16_t av = avLow | (avHigh << 8);
+        const uint8_t bt = bytecode[IP++];
+        const uint16_t bvLow = bytecode[IP++], bvHigh = bytecode[IP++];
+        const uint16_t bv = bvLow | (bvHigh << 8);
+        auto value = [&](uint8_t type, uint16_t raw) { return type == 0 ? getRegisterById(raw) : raw; };
+        auto put = [&](uint8_t type, uint16_t raw, uint16_t v) { if (type == 0) setRegisterById(raw, v); };
+        const uint16_t a = value(at, av), b = value(bt, bv);
+        switch (opcode) {
+            case 1: put(at, av, b); break;                         // MOV
+            case 3: pushWord(a); break;                            // PUSH
+            case 4: put(at, av, popWord()); break;                 // POP
+            case 5: { uint16_t r=a+b; put(at,av,r); setFlagsForResult(r,a,b,true); break; }
+            case 6: { uint16_t r=a-b; put(at,av,r); setFlagsForResult(r,a,b,false); break; }
+            case 7: setFlagsForResult(a-b,a,b,false); break;       // CMP
+            case 15: put(at,av,readWord(physicalAddress(DS,b))); break;
+            case 16: writeWord(physicalAddress(DS,b),a); break;
+            case 17: { // IN
+                if ((b == 0 || b == 2) && terminalInput.empty()) { IP -= 7; waitingForTerminalInput=true; waitingInputPort=b; return "Waiting for input\n"; }
+                uint16_t v = b == 0 ? parseNumber(terminalInput) : b == 2 ? static_cast<uint8_t>(terminalInput[0]) : b == 0x20 ? lastKeyScanCode : b == 0x30 ? disk->readSectorByte(diskLba,diskCursor++) : b == 0x31 ? diskStatus : 0;
+                put(at,av,v); if (b == 0 || b == 2) terminalInput.clear(); break;
+            }
+            case 18: // OUT
+                if (a == 1) output << dec << b << "\n";
+                else if (a == 3 || a == 0xE9) output << static_cast<char>(b);
+                else if (a == 0x30) diskStatus = disk->writeSectorByte(diskLba,diskCursor++,b & 0xFF) ? 0 : 1;
+                else if (a == 0x32) diskLba = (diskLba & 0xFFFF0000U) | b;
+                else if (a == 0x33) diskLba = (diskLba & 0xFFFFU) | (static_cast<uint32_t>(b) << 16);
+                break;
+            case 29: halted=true; bytecodeActive=false; output << "Program terminated\n"; break;
+            case 30: IP = a; break;                                // JMP
+            case 31: case 32: if (ZF) IP=a; break;
+            case 33: case 34: if (!ZF) IP=a; break;
+            case 35: if (!ZF && SF == OF) IP=a; break;
+            case 36: if (SF != OF) IP=a; break;
+            case 37: pushWord(IP); IP=a; break;                    // CALL
+            case 38: IP=popWord(); break;                          // RET
+            case 39: if (--CX) IP=a; break;                        // LOOP
+            case 40: { // software interrupt: use guest-installed IVT entry when present.
+                const uint8_t vector = static_cast<uint8_t>(a); const uint16_t address = static_cast<uint16_t>(vector) * 4;
+                const uint16_t offset = ram[address] | (static_cast<uint16_t>(ram[address + 1]) << 8);
+                const uint16_t segment = ram[address + 2] | (static_cast<uint16_t>(ram[address + 3]) << 8);
+                pushWord(flagsWord()); pushWord(CS); pushWord(IP); IF = false;
+                if (offset || segment) { IP = offset; CS = segment; }
+                else { uint16_t ret=popWord(), cs=popWord(), fl=popWord(); IP=ret; CS=cs; restoreFlags(fl); }
+                break;
+            }
+            case 41: IP=popWord(); CS=popWord(); restoreFlags(popWord()); IF=true; break;
+            default: halted=true; output << "Unsupported bytecode opcode " << static_cast<int>(opcode) << "\n"; break;
+        }
+        return output.str();
+    }
 
     void printRegs() {
         if (!powered) return;
@@ -638,13 +772,13 @@ public:
     }
 
     void reset() {
-        AX=BX=CX=DX=SP=BP=SI=DI=CS=DS=SS=ES=IP=0;
-        ZF=CF=SF=OF=DF=false;
-        while(!callStack.empty()) callStack.pop();
+        AX=BX=CX=DX=BP=SI=DI=CS=DS=SS=ES=IP=0; SP=0xFFFE;
+        ZF=CF=SF=OF=DF=false; IF=true;
         for(auto& line : cache) line.valid = false;
         fill(ram.begin(), ram.end(), 0);
         stopProgram();
         startedAt = chrono::steady_clock::now();
+        postPassed = true;
     }
 
     uint8_t readByte(uint32_t addr) {
@@ -657,8 +791,12 @@ public:
         int idx = addr % CACHE_SIZE;
         cache[idx].valid = true;
         cache[idx].tag = tag;
-        for (size_t i = 0; i < 64; i++)
-            cache[idx].data[i] = (tag * 64 + i < ram.size()) ? ram[tag * 64 + i] : 0;
+        for (size_t i = 0; i < 64; i++) {
+            const uint32_t physical = tag * 64 + i;
+            cache[idx].data[i] = physical >= 0xF0000 && physical < 0x100000
+                ? biosRom[physical - 0xF0000]
+                : (physical < ram.size() ? ram[physical] : 0);
+        }
         return cache[idx].data[offset];
     }
 
@@ -668,7 +806,7 @@ public:
     }
 
     void writeByte(uint32_t addr, uint8_t val) {
-        if (!powered) return;
+        if (!powered || (addr >= 0xF0000 && addr < 0x100000)) return;
         uint32_t tag = addr / 64, offset = addr % 64;
         for (int i = 0; i < CACHE_SIZE; i++)
             if (cache[i].valid && cache[i].tag == tag) {
@@ -753,13 +891,11 @@ public:
             }
             else if (opcode == "PUSH") {
                 string src; cmdStream >> src;
-                SP -= 2;
-                writeWord(SP, getValue(src));
+                pushWord(getValue(src));
             }
             else if (opcode == "POP") {
                 string dest; cmdStream >> dest;
-                uint16_t val = readWord(SP);
-                SP += 2;
+                uint16_t val = popWord();
                 setRegister(dest, val);
             }
             else if (opcode == "ADD" || opcode == "SUB" || opcode == "CMP") {
@@ -807,12 +943,12 @@ public:
             }
             else if (opcode == "LOAD") {
                 string dest, addr; cmdStream >> dest >> addr;
-                uint16_t val = readWord(getValue(addr));
+                uint16_t val = readWord(physicalAddress(DS, getValue(addr)));
                 setRegister(dest, val);
             }
             else if (opcode == "STORE") {
                 string src, addr; cmdStream >> src >> addr;
-                writeWord(getValue(addr), getRegister(src));
+                writeWord(physicalAddress(DS, getValue(addr)), getRegister(src));
             }
             else if (opcode == "IN") {
                 string dest, port; cmdStream >> dest >> port;
@@ -829,7 +965,10 @@ public:
                 else if (portNumber == 0x02) val = static_cast<uint8_t>(terminalInput[0]);
                 else if (portNumber == 0x10) val = static_cast<uint16_t>(chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - startedAt).count());
                 else if (portNumber == 0x20) val = lastKeyScanCode;
-                else if (portNumber == 0x30) val = 0;
+                else if (portNumber == 0x30) val = disk->readSectorByte(diskLba, diskCursor++);
+                else if (portNumber == 0x31) val = diskStatus;
+                else if (portNumber == 0x32) val = static_cast<uint16_t>(diskLba & 0xFFFF);
+                else if (portNumber == 0x33) val = static_cast<uint16_t>(diskLba >> 16);
                 output << "IN 0x" << hex << portNumber << " -> 0x" << val << "\n";
                 setRegister(dest, val);
                 if (portNumber == 0x00 || portNumber == 0x02) terminalInput.clear();
@@ -839,17 +978,21 @@ public:
                 uint16_t portNumber = getValue(port), val = getValue(src);
                 if (portNumber == 0x01) output << dec << val << "\n";
                 else if (portNumber == 0x03 || portNumber == 0xE9) output << static_cast<char>(val & 0xFF);
+                else if (portNumber == 0x30) { diskStatus = disk->writeSectorByte(diskLba, diskCursor++, val & 0xFF) ? 0 : 1; }
+                else if (portNumber == 0x31) { if (val == 0) { diskCursor = 0; diskStatus = 0; } else diskStatus = 1; }
+                else if (portNumber == 0x32) diskLba = (diskLba & 0xFFFF0000U) | val;
+                else if (portNumber == 0x33) diskLba = (diskLba & 0x0000FFFFU) | (static_cast<uint32_t>(val) << 16);
                 else output << "OUT 0x" << hex << portNumber << " = 0x" << val << " (" << dec << val << ")\n";
             }
             else if (opcode == "PEEK") {
                 string addr; cmdStream >> addr;
-                uint16_t val = readByte(getValue(addr));
+                uint16_t val = readByte(physicalAddress(DS, getValue(addr)));
                 output << "0x" << hex << setw(4) << setfill('0') << getValue(addr)
                        << " = 0x" << setw(2) << (int)val << "\n";
             }
             else if (opcode == "POKE") {
                 string addr, val; cmdStream >> addr >> val;
-                writeByte(getValue(addr), getValue(val) & 0xFF);
+                writeByte(physicalAddress(DS, getValue(addr)), getValue(val) & 0xFF);
             }
             else if (opcode == "DUMP") {
                 string addr, len; cmdStream >> addr >> len;
@@ -891,6 +1034,25 @@ public:
                     }
                 }
             }
+            else if (opcode == "INT") {
+                string vectorText; cmdStream >> vectorText;
+                const uint8_t vector = static_cast<uint8_t>(getValue(vectorText));
+                // Firmware services are synchronous software interrupts.  They preserve
+                // the unified RAM stack convention while avoiding host-side callbacks.
+                // CPU pushes FLAGS, CS and the return IP exactly as an interrupt gate.
+                pushWord(flagsWord()); pushWord(CS); pushWord(IP);
+                if (vector == 0x10) output << static_cast<char>(AX & 0xFF);
+                else if (vector == 0x11) AX = lastKeyScanCode;
+                else if (vector == 0x13) { diskLba = (static_cast<uint32_t>(CX) << 16) | DX; diskCursor = 0; diskStatus = 0; }
+                else if (vector == 0x19) { IP = programLines.size(); output << "Boot service invoked\n"; }
+                else { output << "Unhandled interrupt 0x" << hex << static_cast<int>(vector) << "\n"; }
+                // Firmware handlers end with IRET; model that return before next instruction.
+                const uint16_t returnIp = popWord(), returnCs = popWord(), returnFlags = popWord();
+                if (vector != 0x19) { IP = returnIp; CS = returnCs; restoreFlags(returnFlags); }
+            }
+            else if (opcode == "IRET") {
+                IP = popWord(); CS = popWord(); restoreFlags(popWord());
+            }
             else if (opcode == "CLC") { CF = false; }
             else if (opcode == "STC") { CF = true; }
             else if (opcode == "CMC") { CF = !CF; }
@@ -922,12 +1084,12 @@ public:
             else if (opcode == "CALL") {
                 string label; cmdStream >> label;
                 if (programLabels.count(label)) {
-                    callStack.push(IP);
+                    pushWord(IP);
                     IP = programLabels[label];
                 } else { output << "Label " << label << " not found\n"; return output.str(); }
             }
             else if (opcode == "RET") {
-                if (!callStack.empty()) { IP = callStack.top(); callStack.pop(); }
+                if (SP != 0xFFFE) { IP = popWord(); }
                 else { output << "RET without CALL\n"; return output.str(); }
             }
             else if (opcode == "LOOP") {
@@ -944,6 +1106,9 @@ public:
     }
 
 private:
+    uint16_t getRegisterById(uint16_t id) { const uint16_t regs[] = {AX,BX,CX,DX,SP,BP,SI,DI,CS,DS,SS,ES}; return id < 12 ? regs[id] : 0; }
+    void setRegisterById(uint16_t id, uint16_t value) { uint16_t* regs[] = {&AX,&BX,&CX,&DX,&SP,&BP,&SI,&DI,&CS,&DS,&SS,&ES}; if (id < 12) *regs[id] = value; }
+
     static uint16_t parseNumber(const string& value) {
         if (value.empty()) return 0;
         size_t start = 0; bool negative = false;
@@ -964,7 +1129,8 @@ private:
             }
         }
         if (arg == "AX" || arg == "BX" || arg == "CX" || arg == "DX" ||
-            arg == "SP" || arg == "BP" || arg == "SI" || arg == "DI") {
+            arg == "SP" || arg == "BP" || arg == "SI" || arg == "DI" ||
+            arg == "CS" || arg == "DS" || arg == "SS" || arg == "ES") {
             return getRegister(arg);
         }
         if (arg[0] == '0' && (arg[1] == 'x' || arg[1] == 'X')) {
@@ -982,6 +1148,10 @@ private:
         if (reg == "BP") return BP;
         if (reg == "SI") return SI;
         if (reg == "DI") return DI;
+        if (reg == "CS") return CS;
+        if (reg == "DS") return DS;
+        if (reg == "SS") return SS;
+        if (reg == "ES") return ES;
         return 0;
     }
 
@@ -990,6 +1160,8 @@ private:
         if (reg == "CX") { CX = val; return; } if (reg == "DX") { DX = val; return; }
         if (reg == "SP") { SP = val; return; } if (reg == "BP") { BP = val; return; }
         if (reg == "SI") { SI = val; return; } if (reg == "DI") { DI = val; return; }
+        if (reg == "CS") { CS = val; return; } if (reg == "DS") { DS = val; return; }
+        if (reg == "SS") { SS = val; return; } if (reg == "ES") { ES = val; return; }
     }
 };
 
@@ -999,22 +1171,40 @@ private:
 class Asm16Compiler {
 public:
     static constexpr const char* MAGIC = "ASM16EXE1\n";
-    static bool compile(const string& sourcePath, const string& source, const string& parameters,
-                        string& executable, string& error) {
-        if (sourcePath.empty() || fs::path(sourcePath).extension() != ".asm") {
-            error = "Input path must name an .asm source file"; return false;
+    static constexpr const char* BINARY_MAGIC = "ASM16BIN";
+    struct Executable { vector<uint8_t> code, data; uint16_t entryPoint = 0, loadAddress = 0x0100; };
+
+    static bool compile(const string& sourcePath, const string& source, const string&, string& executable, string& error) {
+        if (sourcePath.empty() || fs::path(sourcePath).extension() != ".asm") { error="Input path must name an .asm source file"; return false; }
+        struct Line { string op, a, b; size_t number; }; vector<Line> lines; unordered_map<string,uint16_t> labels;
+        istringstream input(source); string raw; size_t number=0;
+        const unordered_map<string,uint8_t> ops={{"MOV",1},{"PUSH",3},{"POP",4},{"ADD",5},{"SUB",6},{"CMP",7},{"LOAD",15},{"STORE",16},{"IN",17},{"OUT",18},{"HLT",29},{"JMP",30},{"JE",31},{"JZ",32},{"JNE",33},{"JNZ",34},{"JG",35},{"JL",36},{"CALL",37},{"RET",38},{"LOOP",39},{"INT",40},{"IRET",41}};
+        while (getline(input,raw)) {
+            ++number; const size_t semicolon=raw.find(';'); if (semicolon != string::npos) raw.erase(semicolon);
+            const size_t first=raw.find_first_not_of(" \t"); if (first==string::npos) continue; raw=raw.substr(first);
+            if (raw.back()==':') { string label=raw.substr(0,raw.size()-1); if (labels.count(label)) { error="Duplicate label: "+label; return false; } labels[label]=static_cast<uint16_t>(lines.size()*7); continue; }
+            replace(raw.begin(),raw.end(),',',' '); istringstream words(raw); Line line{"","","",number}; words>>line.op>>line.a>>line.b;
+            transform(line.op.begin(),line.op.end(),line.op.begin(),[](unsigned char c){return static_cast<char>(toupper(c));});
+            if (!ops.count(line.op)) { error="Unsupported instruction on line "+to_string(number)+": "+line.op; return false; } lines.push_back(line);
         }
-        if (source.empty()) { error = "Source file is empty"; return false; }
-        // Parameters are recorded with the executable so the invocation is reproducible.
-        executable = string(MAGIC) + "; asm16 " + sourcePath + " " + parameters + "\n" + source;
-        error.clear();
-        return true;
+        auto reg = [](const string& text) -> int { static const array<string,12> names={"AX","BX","CX","DX","SP","BP","SI","DI","CS","DS","SS","ES"}; for(size_t i=0;i<names.size();++i) if(text==names[i]) return static_cast<int>(i); return -1; };
+        auto numberValue = [](const string& text) { return static_cast<uint16_t>(stoul(text,nullptr,text.rfind("0x",0)==0||text.rfind("0X",0)==0?16:10)); };
+        Executable exe; exe.code.reserve(lines.size()*7);
+        for (const auto& line : lines) {
+            const uint8_t op=ops.at(line.op); uint8_t at=1,bt=1; uint16_t av=0,bv=0;
+            auto operand=[&](const string& text,uint8_t& type,uint16_t& value) -> bool { if(text.empty()) return true; int r=reg(text); if(r>=0) {type=0;value=r;return true;} auto it=labels.find(text); if(it!=labels.end()){type=1;value=it->second;return true;} try {type=1;value=numberValue(text);return true;}catch(...){error="Unknown operand on line "+to_string(line.number)+": "+text;return false;} };
+            if(!operand(line.a,at,av)||!operand(line.b,bt,bv)) return false;
+            exe.code.insert(exe.code.end(),{op,at,static_cast<uint8_t>(av),static_cast<uint8_t>(av>>8),bt,static_cast<uint8_t>(bv),static_cast<uint8_t>(bv>>8)});
+        }
+        // Header: magic, binary magic, version, entry, load address, code bytes, data bytes.
+        executable=string(MAGIC)+BINARY_MAGIC; executable.push_back(1);
+        auto word=[&](uint16_t v){executable.push_back(v&0xFF);executable.push_back(v>>8);}; auto dword=[&](uint32_t v){for(int i=0;i<4;++i) executable.push_back((v>>(8*i))&0xFF);};
+        word(exe.entryPoint); word(exe.loadAddress); dword(exe.code.size()); dword(exe.data.size()); executable.append(reinterpret_cast<const char*>(exe.code.data()),exe.code.size()); executable.append(reinterpret_cast<const char*>(exe.data.data()),exe.data.size()); error.clear(); return true;
     }
-    static bool readExecutable(const string& executable, string& source) {
-        const string magic(MAGIC);
-        if (executable.rfind(magic, 0) != 0) return false;
-        source = executable.substr(magic.size());
-        return true;
+    static bool readExecutable(const string& image, Executable& executable) {
+        const string header=string(MAGIC)+BINARY_MAGIC; if(image.rfind(header,0)!=0 || image.size()<header.size()+13) return false; size_t p=header.size(); if(static_cast<uint8_t>(image[p++])!=1) return false;
+        auto word=[&](){uint16_t v=static_cast<uint8_t>(image[p])|(static_cast<uint16_t>(static_cast<uint8_t>(image[p+1]))<<8);p+=2;return v;}; auto dword=[&](){uint32_t v=0;for(int i=0;i<4;++i)v|=static_cast<uint32_t>(static_cast<uint8_t>(image[p++]))<<(i*8);return v;};
+        executable.entryPoint=word(); executable.loadAddress=word(); uint32_t codeSize=dword(),dataSize=dword(); if(codeSize%7 || p+codeSize+dataSize!=image.size()) return false; executable.code.assign(image.begin()+p,image.begin()+p+codeSize);p+=codeSize;executable.data.assign(image.begin()+p,image.end());return true;
     }
 };
 
@@ -1310,15 +1500,18 @@ private:
     }
 
     void runExecutable(const string& executableName) {
-        string source;
-        if (!Asm16Compiler::readExecutable(disk.readFile(executableName), source)) {
-            appendOutput("ERROR: " + executableName + " is not an ASM16 executable\n"); return;
+        if (!cpu.isBytecodeActive()) {
+            Asm16Compiler::Executable executable;
+            if (!Asm16Compiler::readExecutable(disk.readFile(executableName), executable)) {
+                appendOutput("ERROR: " + executableName + " is not an ASM16 binary executable\n"); return;
+            }
+            cpu.loadBytecode(executable.code, executable.entryPoint, executable.loadAddress);
         }
         statusBar = "EXECUTING";
         appendOutput("=== " + executableName + " ===\n");
         constexpr size_t maxInstructions = 100000;
-        for (size_t step = 0; step < maxInstructions; ++step) {
-            appendOutput(cpu.executeProgram(source));
+        for (size_t executed = 0; executed < maxInstructions; ++executed) {
+            appendOutput(cpu.step());
             if (cpu.isWaitingForTerminalInput()) {
                 statusBar = "WAITING FOR INPUT";
                 beginPrompt(Prompt::PortInput, "PROGRAM INPUT FOR PORT 0x" + to_string(cpu.getWaitingInputPort()) + ":");
@@ -1326,9 +1519,18 @@ private:
             }
             if (!cpu.hasProgram()) { appendOutput("[Program complete]\n"); statusBar = "ONLINE"; return; }
         }
-        cpu.stopProgram();
-        appendOutput("ERROR: execution stopped after 100000 instructions\n");
-        statusBar = "ONLINE";
+        cpu.stopProgram(); appendOutput("ERROR: execution stopped after 100000 instructions\n"); statusBar = "ONLINE";
+    }
+
+    void stepExecutable() {
+        if (activeExecutable.empty()) { appendOutput("ERROR: Select an executable first\n"); return; }
+        if (!cpu.isBytecodeActive()) {
+            Asm16Compiler::Executable executable;
+            if (!Asm16Compiler::readExecutable(disk.readFile(activeExecutable), executable)) { appendOutput("ERROR: Invalid executable\n"); return; }
+            cpu.loadBytecode(executable.code, executable.entryPoint, executable.loadAddress);
+        }
+        appendOutput(cpu.step());
+        if (!cpu.hasProgram()) appendOutput("[Program complete]\n");
     }
 
     void createProgram() { beginPrompt(Prompt::FileName, "NEW FILE NAME (.asm):"); }
@@ -1354,13 +1556,7 @@ private:
             return;
         }
         editorFileName = entry.path;
-        if (fs::path(entry.path).extension() == ".exe") {
-            activeExecutable = entry.path;
-            if (!Asm16Compiler::readExecutable(disk.readFile(entry.path), editor)) {
-                appendOutput("ERROR: " + entry.path + " is not an ASM16 executable\n"); return;
-            }
-            appendOutput("Selected executable: " + activeExecutable + " (F12 to step)\n");
-        } else editor = disk.readFile(entry.path);
+        editor = disk.readFile(entry.path);
         cursorLine = cursorCol = 0;
         updateEditorLines();
         screen = Screen::Editor;
@@ -1396,6 +1592,17 @@ private:
         cerr << "GLFW error: " << description << '\n';
     }
 
+    static uint16_t set1ScanCode(int key) {
+        // GLFW is an input API; expose PC/AT Set 1 make codes to guest programs.
+        if (key >= GLFW_KEY_A && key <= GLFW_KEY_Z) {
+            static constexpr uint8_t codes[] = {0x1E,0x30,0x2E,0x20,0x12,0x21,0x22,0x23,0x17,0x24,0x25,0x26,0x32,0x31,0x18,0x19,0x10,0x13,0x1F,0x14,0x16,0x2F,0x11,0x2D,0x15,0x2C};
+            return codes[key - GLFW_KEY_A];
+        }
+        if (key >= GLFW_KEY_1 && key <= GLFW_KEY_9) { static constexpr uint8_t codes[] = {0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A}; return codes[key - GLFW_KEY_1]; }
+        if (key == GLFW_KEY_0) return 0x0B;
+        switch (key) { case GLFW_KEY_ENTER: return 0x1C; case GLFW_KEY_ESCAPE: return 0x01; case GLFW_KEY_BACKSPACE: return 0x0E; case GLFW_KEY_TAB: return 0x0F; case GLFW_KEY_SPACE: return 0x39; case GLFW_KEY_LEFT: return 0x4B; case GLFW_KEY_RIGHT: return 0x4D; case GLFW_KEY_UP: return 0x48; case GLFW_KEY_DOWN: return 0x50; default: return 0; }
+    }
+
     static void keyCallback(GLFWwindow* window, int key, int, int action, int mods) {
         if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
         auto* app = static_cast<TerminalInterface*>(glfwGetWindowUserPointer(window));
@@ -1403,7 +1610,8 @@ private:
 
         if (key == GLFW_KEY_F11) { app->togglePower(); return; }
         if (!app->isPowered || app->booting) return;
-        app->cpu.setLastKeyScanCode(static_cast<uint16_t>(key));
+        app->cpu.setLastKeyScanCode(set1ScanCode(key));
+        app->cpu.raiseKeyboardIRQ();
         if (app->prompt != Prompt::None) {
             if (key == GLFW_KEY_ESCAPE) { app->prompt = Prompt::None; return; }
             if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) { app->finishPrompt(); return; }
@@ -1448,8 +1656,8 @@ private:
         else if (key == GLFW_KEY_F6) app->saveProgram();
         else if (key == GLFW_KEY_F7) { app->screen = Screen::Browser; app->showEditor = false; }
         else if (key == GLFW_KEY_ESCAPE) { app->screen = Screen::Browser; app->showEditor = false; }
-        else if (key == GLFW_KEY_F8) app->beginPrompt(Prompt::PortInput, "PORT INPUT (0x00 STRING / 0x02 ASCII):");
-        else if (key == GLFW_KEY_F9) app->beginPrompt(Prompt::DirectoryName, "NEW DIRECTORY NAME:");
+        else if (key == GLFW_KEY_F8) app->stepExecutable();
+        else if (key == GLFW_KEY_F9) { app->cpu.addBreakpoint(app->cpu.instructionPointer()); app->appendOutput("Breakpoint added at 0x" + to_string(app->cpu.instructionPointer()) + "\n"); }
         else if (key == GLFW_KEY_BACKSPACE) app->deleteChar();
         else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) app->insertChar('\n');
         else if (key == GLFW_KEY_UP) app->moveCursorUp();
@@ -1767,6 +1975,8 @@ private:
                     "OPEN asm16.exe: compile <source.asm> [-o <program.exe>]\n"
                     "OPEN a program .exe: run it to completion\n"
                     "F8     Set terminal input ports 0x00 / 0x02\n"
+                    "DISK: ports 30 DATA, 31 RESET/STATUS, 32/33 LBA\n"
+                    "INT 10 video, INT 11 keyboard, INT 13 disk select\n"
                     "F2     Reset system\n"
                     "F3     List directory\n"
                     "F4     Create new file\n"
