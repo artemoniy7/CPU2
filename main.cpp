@@ -492,7 +492,7 @@ private:
             value *= decay;
             samples[i] = static_cast<int16_t>(value * 32767.0f);
         }
-        buffer.loadFromSamples(samples.data(), numSamples, 1, sampleRate, {});
+        (void)buffer.loadFromSamples(samples.data(), numSamples, 1, sampleRate, {});
     }
 
 public:
@@ -1331,7 +1331,13 @@ private:
             return;
         }
         editorFileName = entry.path;
-        editor = disk.readFile(entry.path);
+        if (fs::path(entry.path).extension() == ".exe") {
+            activeExecutable = entry.path;
+            if (!Asm16Compiler::readExecutable(disk.readFile(entry.path), editor)) {
+                appendOutput("ERROR: " + entry.path + " is not an ASM16 executable\n"); return;
+            }
+            appendOutput("Selected executable: " + activeExecutable + " (F12 to step)\n");
+        } else editor = disk.readFile(entry.path);
         cursorLine = cursorCol = 0;
         updateEditorLines();
         screen = Screen::Editor;
@@ -1619,6 +1625,10 @@ private:
 
         rect(screenX, screenY, screenW, screenH, 0.0f, 0.075f * brightness, 0.039f * brightness);
 
+        // terminalScale нужен и внутри блока else, и в панели prompt,
+        // поэтому объявляем его здесь, до ветвлений.
+        const float terminalScale = max(1.1f, 1.6f * scale);
+
         if (booting || !isPowered || (powerAnimation < 0.3f && !shuttingDown)) {
             float alpha = booting ? 1.0f : (isPowered ? 1.0f - powerAnimation * 3.0f : 1.0f);
             rect(screenX, screenY, screenW, screenH, 0.0f, 0.0f, 0.0f, alpha * 0.8f);
@@ -1674,8 +1684,6 @@ private:
             for (int y = static_cast<int>(screenY); y < screenY + screenH; y += max(2, static_cast<int>(4 * scale)))
                 rect(screenX, static_cast<float>(y), screenW, 1, 0.0f, 0.0f, 0.0f, 0.25f);
             rect(screenX, screenY, screenW, 2 * scale, 0.15f, 0.95f, 0.52f, 0.45f);
-
-            const float terminalScale = max(1.1f, 1.6f * scale);
 
             text(screenX + 18 * scale, screenY + 16 * scale,
                  "CPU-16  //  " + statusBar + "  //  " + disk.getCurrentDirectory(),
