@@ -884,7 +884,7 @@ public:
             else if (opcode == "CLD") { DF = false; }
             else if (opcode == "STD") { DF = true; }
             else if (opcode == "NOP") { }
-            else if (opcode == "HLT") { output << "Program terminated\n"; return output.str(); }
+            else if (opcode == "HLT") { IP = programLines.size(); output << "Program terminated\n"; return output.str(); }
             else if (opcode == "JMP") {
                 string label; cmdStream >> label;
                 if (programLabels.count(label)) { IP = programLabels[label]; }
@@ -1021,7 +1021,7 @@ private:
     string statusBar = "OFFLINE";
     string currentDir = "/";
     string activeExecutable;
-    enum class Prompt { None, FileName, DirectoryName, PortInput };
+    enum class Prompt { None, FileName, DirectoryName, PortInput, CompilerCommand };
     Prompt prompt = Prompt::None;
     string promptText;
     string promptValue;
@@ -1267,30 +1267,47 @@ private:
             else appendOutput("ERROR: Directory already exists or parent folder is missing\n");
         } else if (kind == Prompt::PortInput) {
             cpu.setTerminalInput(value); appendOutput("Port 0x00/0x02 input set: " + value + "\n");
+        } else if (kind == Prompt::CompilerCommand) {
+            istringstream command(value);
+            string verb, sourcePath, option, outputName;
+            command >> verb >> sourcePath;
+            if (verb != "compile" || sourcePath.empty()) {
+                appendOutput("ASM16 usage: compile <source.asm> [-o <program.exe>]\n"); return;
+            }
+            if (command >> option) {
+                if (option != "-o" || !(command >> outputName)) {
+                    appendOutput("ASM16 usage: compile <source.asm> [-o <program.exe>]\n"); return;
+                }
+            }
+            if (outputName.empty()) { fs::path outputPath(sourcePath); outputPath.replace_extension(".exe"); outputName = outputPath.string(); }
+            string executable, error;
+            if (!Asm16Compiler::compile(sourcePath, disk.readFile(sourcePath), "-o " + outputName, executable, error)) {
+                appendOutput("ASM16 ERROR: " + error + "\n"); return;
+            }
+            if (!disk.fileExists(outputName) && !disk.createFile(outputName)) {
+                appendOutput("ASM16 ERROR: Cannot create " + outputName + "\n"); return;
+            }
+            if (!disk.writeFile(outputName, executable)) { appendOutput("ASM16 ERROR: Disk full\n"); return; }
+            appendOutput("ASM16: created " + outputName + "\n");
+            beginPrompt(Prompt::CompilerCommand, "ASM16> compile <source.asm> [-o <program.exe>]");
         }
     }
 
-    void compileProgram() {
-        if (!isPowered || editorFileName.empty()) { appendOutput("ERROR: Create or open an .asm file first\n"); return; }
-        saveProgram();
-        string executable, error;
-        fs::path outputPath(editorFileName); outputPath.replace_extension(".exe");
-        string outputName = outputPath.string();
-        const string parameters = "-o " + outputName;
-        if (!Asm16Compiler::compile(editorFileName, editor, parameters, executable, error)) { appendOutput("ASM16 ERROR: " + error + "\n"); return; }
-        if (!disk.fileExists(outputName) && !disk.createFile(outputName)) { appendOutput("ASM16 ERROR: Cannot create " + outputName + "\n"); return; }
-        if (!disk.writeFile(outputName, executable)) { appendOutput("ASM16 ERROR: Disk full\n"); return; }
-        activeExecutable = outputName; cpu.stopProgram();
-        appendOutput("ASM16: asm16.exe " + editorFileName + " " + parameters + "\nCreated: " + outputName + "\nReady for F12 single-step execution.\n");
-    }
-
-    void stepProgram() {
-        if (activeExecutable.empty()) { appendOutput("ERROR: Compile an .asm source with F5 first\n"); return; }
+    void runExecutable(const string& executableName) {
         string source;
-        if (!Asm16Compiler::readExecutable(disk.readFile(activeExecutable), source)) { appendOutput("ERROR: Invalid ASM16 executable\n"); return; }
-        statusBar = "STEPPING";
-        appendOutput(cpu.executeProgram(source));
-        if (!cpu.hasProgram()) appendOutput("[Program complete]\n");
+        if (!Asm16Compiler::readExecutable(disk.readFile(executableName), source)) {
+            appendOutput("ERROR: " + executableName + " is not an ASM16 executable\n"); return;
+        }
+        cpu.stopProgram();
+        statusBar = "EXECUTING";
+        appendOutput("=== " + executableName + " ===\n");
+        constexpr size_t maxInstructions = 100000;
+        for (size_t step = 0; step < maxInstructions; ++step) {
+            appendOutput(cpu.executeProgram(source));
+            if (!cpu.hasProgram()) { appendOutput("[Program complete]\n"); statusBar = "ONLINE"; return; }
+        }
+        cpu.stopProgram();
+        appendOutput("ERROR: execution stopped after 100000 instructions\n");
         statusBar = "ONLINE";
     }
 
@@ -1301,6 +1318,18 @@ private:
         if (entries.empty() || fileSelection >= (int)entries.size()) return;
         const auto& entry = entries[fileSelection];
         if (entry.isDirectory) { disk.changeDirectory(entry.path); fileSelection = 0; return; }
+        if (fs::path(entry.path).filename() == "asm16.exe") {
+            screen = Screen::Editor; showEditor = false;
+            appendOutput("ASM16 compiler console opened.\n");
+            beginPrompt(Prompt::CompilerCommand, "ASM16> compile <source.asm> [-o <program.exe>]");
+            return;
+        }
+        if (fs::path(entry.path).extension() == ".exe") {
+            activeExecutable = entry.path;
+            screen = Screen::Editor; showEditor = false;
+            runExecutable(activeExecutable);
+            return;
+        }
         editorFileName = entry.path;
         if (fs::path(entry.path).extension() == ".exe") {
             activeExecutable = entry.path;
@@ -1389,8 +1418,7 @@ private:
             return;
         }
         // Editor / general shortcuts
-        if (key == GLFW_KEY_F5) app->compileProgram();
-        else if (key == GLFW_KEY_F12) app->stepProgram();
+        if (key == GLFW_KEY_F5) app->saveProgram();
         else if (key == GLFW_KEY_F2) app->resetMachine();
         else if (key == GLFW_KEY_F3) app->appendOutput(app->disk.listFiles());
         else if (key == GLFW_KEY_F4) app->createProgram();
@@ -1663,7 +1691,7 @@ private:
 
             text(screenX + 18 * scale, screenY + 38 * scale,
                  screen == Screen::Editor
-                     ? "F5 COMPILE  F12 STEP  F6 SAVE  F8 INPUT  F9 MKDIR"
+                     ? "F5 SAVE  F6 SAVE  F7 FILES  F8 INPUT  F9 MKDIR"
                      : "ENTER SELECT  ARROWS MOVE  F4 NEW  F10 DEL  ESC BACK  F1 HELP  F11 POWER",
                  terminalScale * 0.7f, 0.26f, 0.72f, 0.39f);
 
@@ -1713,8 +1741,8 @@ private:
             } else if (showHelp) {
                 string help =
                     "=== CPU-16 HELP ===\n\n"
-                    "F5     Compile .asm to .exe using asm16.exe\n"
-                    "F12    Execute one instruction from .exe\n"
+                    "OPEN asm16.exe: compile <source.asm> [-o <program.exe>]\n"
+                    "OPEN a program .exe: run it to completion\n"
                     "F8     Set terminal input ports 0x00 / 0x02\n"
                     "F2     Reset system\n"
                     "F3     List directory\n"
@@ -1833,7 +1861,7 @@ private:
         rect(caseX + 122 * scale, footerY, caseW - 244 * scale, 54 * scale,
              0.43f, 0.32f, 0.19f);
         text(caseX + 150 * scale, footerY + 18 * scale,
-             "[F11] POWER  [F5] COMPILE  [F12] STEP  [F1] HELP",
+             "[F11] POWER  [F5] SAVE  [ENTER] OPEN EXE  [F1] HELP",
              1.35f * scale, 0.76f, 0.64f, 0.40f);
     }
 
