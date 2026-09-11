@@ -1261,6 +1261,7 @@ private:
             if (!disk.createFile(value)) { appendOutput("ERROR: File already exists or parent folder is missing\n"); return; }
             editorFileName = value; editor = "; " + value + "\n; CPU-16 program\n\nHLT";
             cursorLine = cursorCol = 0; updateEditorLines(); screen = Screen::Editor; showEditor = true;
+            outputBuffer.clear();
             appendOutput("Created and opened: " + value + "\n");
         } else if (kind == Prompt::DirectoryName) {
             if (disk.createDirectory(value)) appendOutput("Created directory: " + value + "\n");
@@ -1318,6 +1319,8 @@ private:
         if (entries.empty() || fileSelection >= (int)entries.size()) return;
         const auto& entry = entries[fileSelection];
         if (entry.isDirectory) { disk.changeDirectory(entry.path); fileSelection = 0; return; }
+        // Each file has its own clean terminal session; do not carry output between files.
+        outputBuffer.clear();
         if (fs::path(entry.path).filename() == "asm16.exe") {
             screen = Screen::Editor; showEditor = false;
             appendOutput("ASM16 compiler console opened.\n");
