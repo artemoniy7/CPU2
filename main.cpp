@@ -605,6 +605,12 @@ private:
     vector<uint8_t> ram = vector<uint8_t>(1024 * 1024, 0);
     bool debugMode = false;
     bool powered = false;
+    string loadedSource;
+    vector<string> programLines;
+    unordered_map<string, int> programLabels;
+    string terminalInput;
+    uint16_t lastKeyScanCode = 0;
+    chrono::steady_clock::time_point startedAt = chrono::steady_clock::now();
 
 public:
     CPU(VirtualDisk* d) : disk(d) {}
@@ -612,6 +618,10 @@ public:
     void setDebug(bool on) { debugMode = on; }
     void setPowered(bool on) { powered = on; }
     bool isPowered() const { return powered; }
+    void setTerminalInput(const string& input) { terminalInput = input; }
+    void setLastKeyScanCode(uint16_t code) { lastKeyScanCode = code; }
+    void stopProgram() { loadedSource.clear(); programLines.clear(); programLabels.clear(); IP = 0; }
+    bool hasProgram() const { return !programLines.empty() && IP < programLines.size(); }
 
     void printRegs() {
         if (!powered) return;
@@ -629,6 +639,8 @@ public:
         while(!callStack.empty()) callStack.pop();
         for(auto& line : cache) line.valid = false;
         fill(ram.begin(), ram.end(), 0);
+        stopProgram();
+        startedAt = chrono::steady_clock::now();
     }
 
     uint8_t readByte(uint32_t addr) {
@@ -690,32 +702,34 @@ public:
             return output.str();
         }
 
-        istringstream iss(code);
-        string line;
-        unordered_map<string, int> labels;
-        vector<string> lines;
-
-        while (getline(iss, line)) {
-            size_t comment = line.find(';');
-            if (comment != string::npos) line = line.substr(0, comment);
-            line.erase(0, line.find_first_not_of(" \t"));
-            line.erase(line.find_last_not_of(" \t") + 1);
-            if (line.empty()) continue;
-
-            if (line.back() == ':') {
-                labels[line.substr(0, line.size()-1)] = lines.size();
-                continue;
+        if (loadedSource != code) {
+            loadedSource = code;
+            programLines.clear();
+            programLabels.clear();
+            istringstream iss(code);
+            string line;
+            while (getline(iss, line)) {
+                size_t comment = line.find(';');
+                if (comment != string::npos) line = line.substr(0, comment);
+                size_t first = line.find_first_not_of(" \t");
+                if (first == string::npos) continue;
+                line.erase(0, first);
+                size_t last = line.find_last_not_of(" \t");
+                line.erase(last + 1);
+                if (line.back() == ':') {
+                    programLabels[line.substr(0, line.size()-1)] = programLines.size();
+                    continue;
+                }
+                programLines.push_back(line);
             }
-            lines.push_back(line);
+            IP = 0;
         }
-
-        IP = 0;
-        while (IP < lines.size()) {
+        if (IP < programLines.size()) {
             if (!powered) {
                 output << "CPU powered off during execution\n";
                 return output.str();
             }
-            string instr = lines[IP];
+            string instr = programLines[IP];
             IP++;
             istringstream cmdStream(instr);
             string opcode;
@@ -798,14 +812,21 @@ public:
             }
             else if (opcode == "IN") {
                 string dest, port; cmdStream >> dest >> port;
-                uint16_t val = 0;
-                output << "Input for port " << port << ": ";
+                uint16_t portNumber = getValue(port), val = 0;
+                if (portNumber == 0x00) val = parseNumber(terminalInput);
+                else if (portNumber == 0x02) val = terminalInput.empty() ? 0 : static_cast<uint8_t>(terminalInput[0]);
+                else if (portNumber == 0x10) val = static_cast<uint16_t>(chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - startedAt).count());
+                else if (portNumber == 0x20) val = lastKeyScanCode;
+                else if (portNumber == 0x30) val = 0;
+                output << "IN 0x" << hex << portNumber << " -> 0x" << val << "\n";
                 setRegister(dest, val);
             }
             else if (opcode == "OUT") {
                 string port, src; cmdStream >> port >> src;
-                uint16_t val = getValue(src);
-                output << "Port " << port << " = 0x" << hex << val << " (" << dec << val << ")\n";
+                uint16_t portNumber = getValue(port), val = getValue(src);
+                if (portNumber == 0x01) output << dec << val << "\n";
+                else if (portNumber == 0x03 || portNumber == 0xE9) output << static_cast<char>(val & 0xFF);
+                else output << "OUT 0x" << hex << portNumber << " = 0x" << val << " (" << dec << val << ")\n";
             }
             else if (opcode == "PEEK") {
                 string addr; cmdStream >> addr;
@@ -832,14 +853,14 @@ public:
                 // Читаем всё, что осталось после опкода PRINT, как одну строку.
                 string rest;
                 getline(cmdStream, rest);
-            
+
                 // Убираем ведущие пробелы
                 size_t start = rest.find_first_not_of(" \t");
                 if (start == string::npos) {
                     output << "\n";
                 } else {
                     rest = rest.substr(start);
-            
+
                     // Если начинается с кавычки — это строковый литерал.
                     if (!rest.empty() && rest[0] == '"') {
                         // Ищем закрывающую кавычку
@@ -863,33 +884,33 @@ public:
             else if (opcode == "CLD") { DF = false; }
             else if (opcode == "STD") { DF = true; }
             else if (opcode == "NOP") { }
-            else if (opcode == "HLT") { output << "Program terminated\n"; return output.str(); }
+            else if (opcode == "HLT") { IP = programLines.size(); output << "Program terminated\n"; return output.str(); }
             else if (opcode == "JMP") {
                 string label; cmdStream >> label;
-                if (labels.count(label)) { IP = labels[label]; }
+                if (programLabels.count(label)) { IP = programLabels[label]; }
                 else { output << "Label " << label << " not found\n"; return output.str(); }
             }
             else if (opcode == "JE" || opcode == "JZ") {
                 string label; cmdStream >> label;
-                if (ZF && labels.count(label)) { IP = labels[label]; }
+                if (ZF && programLabels.count(label)) { IP = programLabels[label]; }
             }
             else if (opcode == "JNE" || opcode == "JNZ") {
                 string label; cmdStream >> label;
-                if (!ZF && labels.count(label)) { IP = labels[label]; }
+                if (!ZF && programLabels.count(label)) { IP = programLabels[label]; }
             }
             else if (opcode == "JG") {
                 string label; cmdStream >> label;
-                if (!ZF && !SF && !OF && labels.count(label)) { IP = labels[label]; }
+                if (!ZF && !SF && !OF && programLabels.count(label)) { IP = programLabels[label]; }
             }
             else if (opcode == "JL") {
                 string label; cmdStream >> label;
-                if (SF != OF && labels.count(label)) { IP = labels[label]; }
+                if (SF != OF && programLabels.count(label)) { IP = programLabels[label]; }
             }
             else if (opcode == "CALL") {
                 string label; cmdStream >> label;
-                if (labels.count(label)) {
+                if (programLabels.count(label)) {
                     callStack.push(IP);
-                    IP = labels[label];
+                    IP = programLabels[label];
                 } else { output << "Label " << label << " not found\n"; return output.str(); }
             }
             else if (opcode == "RET") {
@@ -899,7 +920,7 @@ public:
             else if (opcode == "LOOP") {
                 string label; cmdStream >> label;
                 CX--;
-                if (CX != 0 && labels.count(label)) { IP = labels[label]; }
+                if (CX != 0 && programLabels.count(label)) { IP = programLabels[label]; }
             }
             else {
                 output << "Unknown instruction: " << opcode << "\n";
@@ -910,6 +931,16 @@ public:
     }
 
 private:
+    static uint16_t parseNumber(const string& value) {
+        if (value.empty()) return 0;
+        size_t start = 0; bool negative = false;
+        if (value[0] == '-') { negative = true; start = 1; }
+        uint32_t result = 0; int base = 10;
+        if (value.size() > start + 2 && value[start] == '0' && (value[start + 1] == 'x' || value[start + 1] == 'X')) { base = 16; start += 2; }
+        for (; start < value.size(); ++start) { char c = value[start]; int digit = isdigit((unsigned char)c) ? c - '0' : (isxdigit((unsigned char)c) ? toupper((unsigned char)c) - 'A' + 10 : -1); if (digit < 0 || digit >= base) break; result = result * base + digit; }
+        return static_cast<uint16_t>(negative ? -static_cast<int32_t>(result) : result);
+    }
+
     uint16_t getValue(const string& arg) {
         if (arg.empty()) return 0;
         if (arg[0] == 'R' && arg.size()>1 && isdigit(arg[1])) {
@@ -924,9 +955,9 @@ private:
             return getRegister(arg);
         }
         if (arg[0] == '0' && (arg[1] == 'x' || arg[1] == 'X')) {
-            return stoi(arg.substr(2), nullptr, 16);
+            return parseNumber(arg);
         }
-        return stoi(arg);
+        return parseNumber(arg);
     }
 
     uint16_t getRegister(const string& reg) {
@@ -950,6 +981,31 @@ private:
 };
 
 // ============================================================
+//  4. ASM16 COMPILER: source .asm -> portable .exe container
+// ============================================================
+class Asm16Compiler {
+public:
+    static constexpr const char* MAGIC = "ASM16EXE1\n";
+    static bool compile(const string& sourcePath, const string& source, const string& parameters,
+                        string& executable, string& error) {
+        if (sourcePath.empty() || fs::path(sourcePath).extension() != ".asm") {
+            error = "Input path must name an .asm source file"; return false;
+        }
+        if (source.empty()) { error = "Source file is empty"; return false; }
+        // Parameters are recorded with the executable so the invocation is reproducible.
+        executable = string(MAGIC) + "; asm16 " + sourcePath + " " + parameters + "\n" + source;
+        error.clear();
+        return true;
+    }
+    static bool readExecutable(const string& executable, string& source) {
+        const string magic(MAGIC);
+        if (executable.rfind(magic, 0) != 0) return false;
+        source = executable.substr(magic.size());
+        return true;
+    }
+};
+
+// ============================================================
 //  4. FULL-SCREEN GLFW TERMINAL INTERFACE
 // ============================================================
 class TerminalInterface {
@@ -964,6 +1020,11 @@ private:
     string outputBuffer = "";
     string statusBar = "OFFLINE";
     string currentDir = "/";
+    string activeExecutable;
+    enum class Prompt { None, FileName, DirectoryName, PortInput, CompilerCommand };
+    Prompt prompt = Prompt::None;
+    string promptText;
+    string promptValue;
 
     bool showHelp = false;
     bool cursorVisible = true;
@@ -1186,25 +1247,92 @@ private:
         }
     }
 
-    void createProgram() {
-        int number = 1;
-        string name;
-        do { name = "program" + to_string(number++) + ".asm"; } while (disk.fileExists(name));
-        if (!disk.createFile(name)) { appendOutput("ERROR: Disk is full\n"); return; }
-        editorFileName = name;
-        editor = "; " + name + "\n; CPU-16 program\n\nHLT";
-        cursorLine = cursorCol = 0;
-        updateEditorLines();
-        screen = Screen::Editor;
-        showEditor = true;
-        appendOutput("Created and opened: " + name + "\n");
+    void beginPrompt(Prompt kind, const string& text) {
+        prompt = kind; promptText = text; promptValue.clear();
     }
+
+    void finishPrompt() {
+        string value = promptValue;
+        Prompt kind = prompt;
+        prompt = Prompt::None;
+        if (value.empty()) { appendOutput("Cancelled: name/input is empty\n"); return; }
+        if (kind == Prompt::FileName) {
+            if (value.find('.') == string::npos) value += ".asm";
+            if (!disk.createFile(value)) { appendOutput("ERROR: File already exists or parent folder is missing\n"); return; }
+            editorFileName = value; editor = "; " + value + "\n; CPU-16 program\n\nHLT";
+            cursorLine = cursorCol = 0; updateEditorLines(); screen = Screen::Editor; showEditor = true;
+            outputBuffer.clear();
+            appendOutput("Created and opened: " + value + "\n");
+        } else if (kind == Prompt::DirectoryName) {
+            if (disk.createDirectory(value)) appendOutput("Created directory: " + value + "\n");
+            else appendOutput("ERROR: Directory already exists or parent folder is missing\n");
+        } else if (kind == Prompt::PortInput) {
+            cpu.setTerminalInput(value); appendOutput("Port 0x00/0x02 input set: " + value + "\n");
+        } else if (kind == Prompt::CompilerCommand) {
+            istringstream command(value);
+            string verb, sourcePath, option, outputName;
+            command >> verb >> sourcePath;
+            if (verb != "compile" || sourcePath.empty()) {
+                appendOutput("ASM16 usage: compile <source.asm> [-o <program.exe>]\n"); return;
+            }
+            if (command >> option) {
+                if (option != "-o" || !(command >> outputName)) {
+                    appendOutput("ASM16 usage: compile <source.asm> [-o <program.exe>]\n"); return;
+                }
+            }
+            if (outputName.empty()) { fs::path outputPath(sourcePath); outputPath.replace_extension(".exe"); outputName = outputPath.string(); }
+            string executable, error;
+            if (!Asm16Compiler::compile(sourcePath, disk.readFile(sourcePath), "-o " + outputName, executable, error)) {
+                appendOutput("ASM16 ERROR: " + error + "\n"); return;
+            }
+            if (!disk.fileExists(outputName) && !disk.createFile(outputName)) {
+                appendOutput("ASM16 ERROR: Cannot create " + outputName + "\n"); return;
+            }
+            if (!disk.writeFile(outputName, executable)) { appendOutput("ASM16 ERROR: Disk full\n"); return; }
+            appendOutput("ASM16: created " + outputName + "\n");
+            beginPrompt(Prompt::CompilerCommand, "ASM16> compile <source.asm> [-o <program.exe>]");
+        }
+    }
+
+    void runExecutable(const string& executableName) {
+        string source;
+        if (!Asm16Compiler::readExecutable(disk.readFile(executableName), source)) {
+            appendOutput("ERROR: " + executableName + " is not an ASM16 executable\n"); return;
+        }
+        cpu.stopProgram();
+        statusBar = "EXECUTING";
+        appendOutput("=== " + executableName + " ===\n");
+        constexpr size_t maxInstructions = 100000;
+        for (size_t step = 0; step < maxInstructions; ++step) {
+            appendOutput(cpu.executeProgram(source));
+            if (!cpu.hasProgram()) { appendOutput("[Program complete]\n"); statusBar = "ONLINE"; return; }
+        }
+        cpu.stopProgram();
+        appendOutput("ERROR: execution stopped after 100000 instructions\n");
+        statusBar = "ONLINE";
+    }
+
+    void createProgram() { beginPrompt(Prompt::FileName, "NEW FILE NAME (.asm):"); }
 
     void openSelectedFile() {
         auto entries = disk.getCurrentEntries();
         if (entries.empty() || fileSelection >= (int)entries.size()) return;
         const auto& entry = entries[fileSelection];
         if (entry.isDirectory) { disk.changeDirectory(entry.path); fileSelection = 0; return; }
+        // Each file has its own clean terminal session; do not carry output between files.
+        outputBuffer.clear();
+        if (fs::path(entry.path).filename() == "asm16.exe") {
+            screen = Screen::Editor; showEditor = false;
+            appendOutput("ASM16 compiler console opened.\n");
+            beginPrompt(Prompt::CompilerCommand, "ASM16> compile <source.asm> [-o <program.exe>]");
+            return;
+        }
+        if (fs::path(entry.path).extension() == ".exe") {
+            activeExecutable = entry.path;
+            screen = Screen::Editor; showEditor = false;
+            runExecutable(activeExecutable);
+            return;
+        }
         editorFileName = entry.path;
         editor = disk.readFile(entry.path);
         cursorLine = cursorCol = 0;
@@ -1249,6 +1377,13 @@ private:
 
         if (key == GLFW_KEY_F11) { app->togglePower(); return; }
         if (!app->isPowered || app->booting) return;
+        app->cpu.setLastKeyScanCode(static_cast<uint16_t>(key));
+        if (app->prompt != Prompt::None) {
+            if (key == GLFW_KEY_ESCAPE) { app->prompt = Prompt::None; return; }
+            if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) { app->finishPrompt(); return; }
+            if (key == GLFW_KEY_BACKSPACE && !app->promptValue.empty()) app->promptValue.pop_back();
+            return;
+        }
 
         if (key == GLFW_KEY_F1) { app->showHelp = !app->showHelp; return; }
         if (app->showHelp) {
@@ -1280,22 +1415,15 @@ private:
             return;
         }
         // Editor / general shortcuts
-        if (key == GLFW_KEY_F5) app->runProgram();
+        if (key == GLFW_KEY_F5) app->saveProgram();
         else if (key == GLFW_KEY_F2) app->resetMachine();
         else if (key == GLFW_KEY_F3) app->appendOutput(app->disk.listFiles());
         else if (key == GLFW_KEY_F4) app->createProgram();
         else if (key == GLFW_KEY_F6) app->saveProgram();
         else if (key == GLFW_KEY_F7) { app->screen = Screen::Browser; app->showEditor = false; }
         else if (key == GLFW_KEY_ESCAPE) { app->screen = Screen::Browser; app->showEditor = false; }
-        else if (key == GLFW_KEY_F8) {
-            app->currentDir = app->disk.getCurrentDirectory();
-            app->appendOutput("Current directory: " + app->currentDir + "\n");
-        }
-        else if (key == GLFW_KEY_F9) {
-            string dir = "new_dir";
-            if (app->disk.createDirectory(dir))
-                app->appendOutput("Created directory: " + dir + "\n");
-        }
+        else if (key == GLFW_KEY_F8) app->beginPrompt(Prompt::PortInput, "PORT INPUT (0x00 STRING / 0x02 ASCII):");
+        else if (key == GLFW_KEY_F9) app->beginPrompt(Prompt::DirectoryName, "NEW DIRECTORY NAME:");
         else if (key == GLFW_KEY_BACKSPACE) app->deleteChar();
         else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) app->insertChar('\n');
         else if (key == GLFW_KEY_UP) app->moveCursorUp();
@@ -1310,8 +1438,8 @@ private:
 
     static void charCallback(GLFWwindow* window, unsigned int codepoint) {
         auto* app = static_cast<TerminalInterface*>(glfwGetWindowUserPointer(window));
-        if (!app || app->showHelp || !app->isPowered || app->booting ||
-            codepoint < 32 || codepoint > 126) return;
+        if (!app || app->showHelp || !app->isPowered || app->booting || codepoint < 32 || codepoint > 126) return;
+        if (app->prompt != Prompt::None) { app->promptValue += static_cast<char>(codepoint); return; }
         app->insertChar(static_cast<char>(codepoint));
     }
 
@@ -1558,7 +1686,7 @@ private:
 
             text(screenX + 18 * scale, screenY + 38 * scale,
                  screen == Screen::Editor
-                     ? "F5 RUN  F6 SAVE  F7 FILES  ESC BACK  F1 HELP  F11 POWER"
+                     ? "F5 SAVE  F6 SAVE  F7 FILES  F8 INPUT  F9 MKDIR"
                      : "ENTER SELECT  ARROWS MOVE  F4 NEW  F10 DEL  ESC BACK  F1 HELP  F11 POWER",
                  terminalScale * 0.7f, 0.26f, 0.72f, 0.39f);
 
@@ -1597,7 +1725,7 @@ private:
                     string name = disk.getName(entries[i].path);
                     string label = entries[i].isDirectory
                         ? "[DIR]  " + name
-                        : "[ASM]  " + name + "  " + to_string(entries[i].size) + " BYTES";
+                        : (fs::path(name).extension() == ".exe" ? "[EXE]  " : "[ASM]  ") + name + "  " + to_string(entries[i].size) + " BYTES";
                     text(screenX + 38 * scale, y,
                          string((int)i == fileSelection ? "> " : "  ") + label,
                          terminalScale * 0.85f, 0.42f, 0.96f, 0.54f);
@@ -1608,13 +1736,14 @@ private:
             } else if (showHelp) {
                 string help =
                     "=== CPU-16 HELP ===\n\n"
-                    "F5     Run program\n"
+                    "OPEN asm16.exe: compile <source.asm> [-o <program.exe>]\n"
+                    "OPEN a program .exe: run it to completion\n"
+                    "F8     Set terminal input ports 0x00 / 0x02\n"
                     "F2     Reset system\n"
                     "F3     List directory\n"
                     "F4     Create new file\n"
                     "F6     Save current program to HDD\n"
                     "F7     Return to file browser\n"
-                    "F8     Show current directory\n"
                     "F9     Create new directory\n"
                     "F10    Delete selected (in browser)\n"
                     "F11    Toggle power\n"
@@ -1657,6 +1786,15 @@ private:
             }
         }
 
+        if (prompt != Prompt::None && !shuttingDown) {
+            const float panelW = screenW * 0.84f, panelH = 72 * scale;
+            const float panelX = screenX + (screenW - panelW) * 0.5f, panelY = screenY + screenH * 0.42f;
+            rect(panelX, panelY, panelW, panelH, 0.02f, 0.16f, 0.07f, 0.98f);
+            text(panelX + 12 * scale, panelY + 12 * scale, promptText, terminalScale * 0.75f, 0.55f, 1.0f, 0.62f);
+            text(panelX + 12 * scale, panelY + 38 * scale, "> " + promptValue + "_", terminalScale, 0.55f, 1.0f, 0.62f);
+            text(panelX + 12 * scale, panelY + 57 * scale, "ENTER CONFIRM   ESC CANCEL", terminalScale * 0.55f, 0.32f, 0.7f, 0.39f);
+        }
+
         if (shuttingDown) {
             const float shutdownProgress = 1.0f - powerAnimation;
             const float collapse = max(0.0f, min(1.0f, (shutdownProgress - 0.22f) / 0.78f));
@@ -1665,29 +1803,29 @@ private:
             const float topEdge = lineY - visibleHeight * 0.5f;
             const float bottomEdge = lineY + visibleHeight * 0.5f;
             const float glow = 0.35f + 0.65f * (1.0f - collapse);
-        
+
             // Небольшой запас по пикселям, чтобы точно перекрыть края.
             const float overlap = 4.0f;
-        
+
             // alpha = 1.0 — полностью непрозрачный чёрный.
             rect(screenX,
                  screenY - overlap,
                  screenW,
                  max(0.0f, (topEdge - screenY) + overlap),
                  0.0f, 0.0f, 0.0f, 1.0f);
-        
+
             rect(screenX,
                  bottomEdge,
                  screenW,
                  max(0.0f, (screenY + screenH - bottomEdge) + overlap),
                  0.0f, 0.0f, 0.0f, 1.0f);
-        
+
             rect(screenX, topEdge, screenW, visibleHeight,
                  0.0f, 0.0f, 0.0f, shutdownProgress * 0.7f);
-        
+
             rect(screenX, lineY - scale, screenW, 2.0f * scale,
                  0.35f * glow, 1.0f * glow, 0.55f * glow);
-        
+
             if (shutdownProgress < 0.55f) {
                 text(screenX + screenW * 0.5f - 54 * scale, lineY - 26 * scale,
                      "SYSTEM HALT", 1.1f * scale, 0.3f * glow, 0.9f * glow, 0.45f * glow);
@@ -1718,12 +1856,16 @@ private:
         rect(caseX + 122 * scale, footerY, caseW - 244 * scale, 54 * scale,
              0.43f, 0.32f, 0.19f);
         text(caseX + 150 * scale, footerY + 18 * scale,
-             "[F11] POWER  [F5] RUN  [F2] RESET  [F1] HELP",
+             "[F11] POWER  [F5] SAVE  [ENTER] OPEN EXE  [F1] HELP",
              1.35f * scale, 0.76f, 0.64f, 0.40f);
     }
 
 public:
     TerminalInterface() : cpu(&disk) {
+        if (!disk.fileExists("asm16.exe")) {
+            disk.createFile("asm16.exe");
+            disk.writeFile("asm16.exe", "ASM16 compiler service: compile <source.asm> [options]");
+        }
         updateEditorLines();
     }
 
