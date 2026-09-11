@@ -609,6 +609,8 @@ private:
     vector<string> programLines;
     unordered_map<string, int> programLabels;
     string terminalInput;
+    bool waitingForTerminalInput = false;
+    uint16_t waitingInputPort = 0;
     uint16_t lastKeyScanCode = 0;
     chrono::steady_clock::time_point startedAt = chrono::steady_clock::now();
 
@@ -618,9 +620,11 @@ public:
     void setDebug(bool on) { debugMode = on; }
     void setPowered(bool on) { powered = on; }
     bool isPowered() const { return powered; }
-    void setTerminalInput(const string& input) { terminalInput = input; }
+    void setTerminalInput(const string& input) { terminalInput = input; waitingForTerminalInput = false; }
+    bool isWaitingForTerminalInput() const { return waitingForTerminalInput; }
+    uint16_t getWaitingInputPort() const { return waitingInputPort; }
     void setLastKeyScanCode(uint16_t code) { lastKeyScanCode = code; }
-    void stopProgram() { loadedSource.clear(); programLines.clear(); programLabels.clear(); IP = 0; }
+    void stopProgram() { loadedSource.clear(); programLines.clear(); programLabels.clear(); IP = 0; waitingForTerminalInput = false; }
     bool hasProgram() const { return !programLines.empty() && IP < programLines.size(); }
 
     void printRegs() {
@@ -813,13 +817,22 @@ public:
             else if (opcode == "IN") {
                 string dest, port; cmdStream >> dest >> port;
                 uint16_t portNumber = getValue(port), val = 0;
+                if ((portNumber == 0x00 || portNumber == 0x02) && terminalInput.empty()) {
+                    // Re-run this IN instruction after the terminal supplies a value.
+                    --IP;
+                    waitingForTerminalInput = true;
+                    waitingInputPort = portNumber;
+                    output << "Waiting for input on port 0x" << hex << portNumber << "...\n";
+                    return output.str();
+                }
                 if (portNumber == 0x00) val = parseNumber(terminalInput);
-                else if (portNumber == 0x02) val = terminalInput.empty() ? 0 : static_cast<uint8_t>(terminalInput[0]);
+                else if (portNumber == 0x02) val = static_cast<uint8_t>(terminalInput[0]);
                 else if (portNumber == 0x10) val = static_cast<uint16_t>(chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - startedAt).count());
                 else if (portNumber == 0x20) val = lastKeyScanCode;
                 else if (portNumber == 0x30) val = 0;
                 output << "IN 0x" << hex << portNumber << " -> 0x" << val << "\n";
                 setRegister(dest, val);
+                if (portNumber == 0x00 || portNumber == 0x02) terminalInput.clear();
             }
             else if (opcode == "OUT") {
                 string port, src; cmdStream >> port >> src;
@@ -1267,7 +1280,9 @@ private:
             if (disk.createDirectory(value)) appendOutput("Created directory: " + value + "\n");
             else appendOutput("ERROR: Directory already exists or parent folder is missing\n");
         } else if (kind == Prompt::PortInput) {
+            const bool resumeExecution = cpu.isWaitingForTerminalInput();
             cpu.setTerminalInput(value); appendOutput("Port 0x00/0x02 input set: " + value + "\n");
+            if (resumeExecution && !activeExecutable.empty()) runExecutable(activeExecutable);
         } else if (kind == Prompt::CompilerCommand) {
             istringstream command(value);
             string verb, sourcePath, option, outputName;
@@ -1299,12 +1314,16 @@ private:
         if (!Asm16Compiler::readExecutable(disk.readFile(executableName), source)) {
             appendOutput("ERROR: " + executableName + " is not an ASM16 executable\n"); return;
         }
-        cpu.stopProgram();
         statusBar = "EXECUTING";
         appendOutput("=== " + executableName + " ===\n");
         constexpr size_t maxInstructions = 100000;
         for (size_t step = 0; step < maxInstructions; ++step) {
             appendOutput(cpu.executeProgram(source));
+            if (cpu.isWaitingForTerminalInput()) {
+                statusBar = "WAITING FOR INPUT";
+                beginPrompt(Prompt::PortInput, "PROGRAM INPUT FOR PORT 0x" + to_string(cpu.getWaitingInputPort()) + ":");
+                return;
+            }
             if (!cpu.hasProgram()) { appendOutput("[Program complete]\n"); statusBar = "ONLINE"; return; }
         }
         cpu.stopProgram();
@@ -1328,6 +1347,7 @@ private:
             return;
         }
         if (fs::path(entry.path).extension() == ".exe") {
+            cpu.stopProgram();
             activeExecutable = entry.path;
             screen = Screen::Editor; showEditor = false;
             runExecutable(activeExecutable);
