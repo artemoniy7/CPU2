@@ -47,6 +47,7 @@ string getSoundsPath() {
 
 // ============================================================
 //  1. VIRTUAL DISK (10 MB) with Directory Support
+//     + Proper free-space allocator (no more duplication!)
 // ============================================================
 class VirtualDisk {
 public:
@@ -60,12 +61,82 @@ public:
 private:
     static const size_t SIZE = 10 * 1024 * 1024;
     static const size_t METADATA_SIZE = 64 * 1024;
-    vector<uint8_t> data;
+    // Usable region for file data: [0, DATA_LIMIT)
+    static const size_t DATA_LIMIT = SIZE - METADATA_SIZE;
 
+    vector<uint8_t> data;
     unordered_map<string, FileEntry> fileTable;
+
+    // Free-space allocator.
+    // Each range is [start, end) — half-open, so length = end - start.
+    struct FreeRange { size_t start; size_t end; };
+    vector<FreeRange> freeList;
+
     string currentDir = "/";
     string diskFileName;
 
+    // ---------- Allocator ----------
+    void rebuildFreeList() {
+        freeList.clear();
+        // Collect all used ranges (only files, not directories).
+        vector<pair<size_t, size_t>> used;
+        for (const auto& [path, entry] : fileTable) {
+            if (!entry.isDirectory && entry.size > 0) {
+                used.emplace_back(entry.offset, entry.offset + entry.size);
+            }
+        }
+        sort(used.begin(), used.end());
+
+        size_t cursor = 0;
+        for (const auto& [s, e] : used) {
+            if (s > cursor) freeList.push_back({cursor, s});
+            cursor = max(cursor, e);
+        }
+        if (cursor < DATA_LIMIT) freeList.push_back({cursor, DATA_LIMIT});
+        coalesceFree();
+    }
+
+    void coalesceFree() {
+        if (freeList.empty()) return;
+        sort(freeList.begin(), freeList.end(),
+             [](const FreeRange& a, const FreeRange& b){ return a.start < b.start; });
+        vector<FreeRange> merged;
+        for (const auto& r : freeList) {
+            if (!merged.empty() && merged.back().end >= r.start) {
+                merged.back().end = max(merged.back().end, r.end);
+            } else {
+                merged.push_back(r);
+            }
+        }
+        freeList.swap(merged);
+    }
+
+    // Allocate `size` bytes. Returns {offset, true} on success,
+    // {0, false} if no contiguous block is large enough.
+    pair<size_t, bool> allocSpace(size_t size) {
+        if (size == 0) return {0, true};
+        for (size_t i = 0; i < freeList.size(); ++i) {
+            size_t len = freeList[i].end - freeList[i].start;
+            if (len >= size) {
+                size_t offset = freeList[i].start;
+                freeList[i].start += size;
+                if (freeList[i].start == freeList[i].end) {
+                    freeList.erase(freeList.begin() + i);
+                }
+                coalesceFree();
+                return {offset, true};
+            }
+        }
+        return {0, false};
+    }
+
+    void freeSpace(size_t offset, size_t size) {
+        if (size == 0) return;
+        freeList.push_back({offset, offset + size});
+        coalesceFree();
+    }
+
+    // ---------- Persistence ----------
     void loadFromDisk() {
         data.assign(SIZE, 0);
         ifstream file(diskFileName, ios::binary);
@@ -77,6 +148,10 @@ private:
                 istringstream input(manifest + 8);
                 string line;
                 while (getline(input, line) && line != "END") {
+                    if (line.rfind("FREE ", 0) == 0) {
+                        // Optional: persisted free list (we rebuild anyway).
+                        continue;
+                    }
                     istringstream row(line);
                     FileEntry entry;
                     int directory = 0;
@@ -87,23 +162,30 @@ private:
                 }
             }
             cout << "Loaded disk from: " << diskFileName << "\n";
-        } else cout << "Created new disk: " << diskFileName << "\n";
+        } else {
+            cout << "Created new disk: " << diskFileName << "\n";
+        }
+        rebuildFreeList();
     }
 
     void saveToDisk() {
         ostringstream manifest;
         manifest << "CPU16FS1\n";
         for (const auto& [path, entry] : fileTable)
-            manifest << entry.offset << ' ' << entry.size << ' ' << entry.isDirectory << ' ' << quoted(entry.path) << "\n";
+            manifest << entry.offset << ' ' << entry.size << ' '
+                     << entry.isDirectory << ' ' << quoted(entry.path) << "\n";
         manifest << "END\n";
         const string listing = manifest.str();
         if (listing.size() > METADATA_SIZE) return;
+
         fill(data.begin() + SIZE - METADATA_SIZE, data.end(), 0);
         copy(listing.begin(), listing.end(), data.begin() + SIZE - METADATA_SIZE);
+
         ofstream file(diskFileName, ios::binary | ios::trunc);
         if (file) file.write(reinterpret_cast<const char*>(data.data()), SIZE);
     }
 
+    // ---------- Path helpers ----------
     string normalizePath(const string& path) const {
         if (path.empty()) return currentDir;
         if (path[0] == '/') return path;
@@ -114,8 +196,7 @@ private:
     string getParentPath(const string& path) const {
         if (path == "/") return "/";
         size_t pos = path.find_last_of('/');
-        if (pos == 0) return "/";
-        if (pos == string::npos) return "/";
+        if (pos == 0 || pos == string::npos) return "/";
         return path.substr(0, pos);
     }
 
@@ -142,6 +223,7 @@ public:
         loadFromDisk();
         if (fileTable.empty()) {
             createDirectoryEntry("/");
+            rebuildFreeList();
             saveToDisk();
         }
     }
@@ -150,6 +232,7 @@ public:
         saveToDisk();
     }
 
+    // ---------- Filesystem API ----------
     bool createDirectory(const string& path) {
         string normalized = normalizePath(path);
         if (fileTable.count(normalized)) return false;
@@ -169,16 +252,8 @@ public:
         string parent = getParentPath(normalized);
         if (!fileTable.count(parent) || !fileTable[parent].isDirectory) return false;
 
-        size_t offset = 0;
-        for (auto& [fname, entry] : fileTable) {
-            if (!entry.isDirectory) {
-                offset = max(offset, entry.offset + entry.size);
-            }
-        }
-        if (offset + 1024 > SIZE - METADATA_SIZE) return false;
-
         FileEntry entry;
-        entry.offset = offset;
+        entry.offset = 0;
         entry.size = 0;
         entry.path = normalized;
         entry.isDirectory = false;
@@ -187,40 +262,121 @@ public:
         return true;
     }
 
+    // Append: extends the file in place if possible, otherwise allocates
+    // a new contiguous region and copies the old content into it.
     bool appendToFile(const string& name, const string& content) {
         string normalized = normalizePath(name);
-        if (!fileTable.count(normalized) || fileTable[normalized].isDirectory) return false;
+        auto it = fileTable.find(normalized);
+        if (it == fileTable.end() || it->second.isDirectory) return false;
 
-        size_t offset = fileTable[normalized].offset + fileTable[normalized].size;
-        if (offset + content.size() > SIZE - METADATA_SIZE) return false;
+        FileEntry& entry = it->second;
+        if (content.empty()) return true;
 
-        copy(content.begin(), content.end(), data.begin() + offset);
-        fileTable[normalized].size += content.size();
-        saveToDisk();
-        return true;
+        // Try to extend in place: is [entry.offset+entry.size, ...+content) free?
+        size_t tail = entry.offset + entry.size;
+        for (auto& r : freeList) {
+            if (r.start <= tail && tail + content.size() <= r.end) {
+                // Consume from this range.
+                if (r.start == tail) {
+                    r.start += content.size();
+                } else {
+                    // tail is in the middle of r — shouldn't happen if ranges
+                    // are correctly maintained, but be safe:
+                    size_t oldEnd = r.end;
+                    r.end = tail;
+                    freeList.push_back({tail + content.size(), oldEnd});
+                    coalesceFree();
+                }
+                copy(content.begin(), content.end(), data.begin() + tail);
+                entry.size += content.size();
+                saveToDisk();
+                return true;
+            }
+        }
+        // Fallback: allocate new region and copy.
+        return writeFile(name, readFile(name) + content);
     }
 
     string readFile(const string& name) {
         string normalized = normalizePath(name);
-        if (!fileTable.count(normalized) || fileTable[normalized].isDirectory) return "";
+        auto it = fileTable.find(normalized);
+        if (it == fileTable.end() || it->second.isDirectory) return "";
 
-        size_t offset = fileTable[normalized].offset;
-        size_t size = fileTable[normalized].size;
+        size_t offset = it->second.offset;
+        size_t size = it->second.size;
         if (offset + size > SIZE) return "";
         return string(data.begin() + offset, data.begin() + offset + size);
     }
 
+    // The fix: free the old region BEFORE allocating a new one.
     bool writeFile(const string& name, const string& content) {
         string normalized = normalizePath(name);
-        if (!fileTable.count(normalized) || fileTable[normalized].isDirectory) return false;
-        size_t offset = 0;
-        for (const auto& [path, entry] : fileTable)
-            if (!entry.isDirectory) offset = max(offset, entry.offset + entry.size);
-        if (offset + content.size() > SIZE - METADATA_SIZE) return false;
-        auto& entry = fileTable[normalized];
-        entry.offset = offset;
-        entry.size = content.size();
-        copy(content.begin(), content.end(), data.begin() + offset);
+        auto it = fileTable.find(normalized);
+        if (it == fileTable.end() || it->second.isDirectory) return false;
+
+        FileEntry& entry = it->second;
+
+        // 1. Release old space.
+        if (entry.size > 0) {
+            freeSpace(entry.offset, entry.size);
+        }
+        entry.offset = 0;
+        entry.size = 0;
+
+        // 2. Allocate new space (empty file is allowed).
+        if (!content.empty()) {
+            auto [offset, ok] = allocSpace(content.size());
+            if (!ok) {
+                // Could not fit — mark file as empty and report failure.
+                saveToDisk();
+                return false;
+            }
+            entry.offset = offset;
+            entry.size = content.size();
+            copy(content.begin(), content.end(), data.begin() + offset);
+        }
+        saveToDisk();
+        return true;
+    }
+
+    // Delete a file (not a directory).
+    bool deleteFile(const string& name) {
+        string normalized = normalizePath(name);
+        auto it = fileTable.find(normalized);
+        if (it == fileTable.end() || it->second.isDirectory) return false;
+
+        if (it->second.size > 0) {
+            freeSpace(it->second.offset, it->second.size);
+        }
+        fileTable.erase(it);
+        saveToDisk();
+        return true;
+    }
+
+    // Delete a directory and everything under it.
+    bool deleteDirectory(const string& path) {
+        string normalized = normalizePath(path);
+        if (normalized == "/") return false;  // never delete root
+        auto it = fileTable.find(normalized);
+        if (it == fileTable.end() || !it->second.isDirectory) return false;
+
+        // Collect all descendants (including the dir itself).
+        vector<string> toErase;
+        toErase.push_back(normalized);
+        for (const auto& [p, e] : fileTable) {
+            if (p.size() > normalized.size() &&
+                p.compare(0, normalized.size(), normalized) == 0 &&
+                p[normalized.size()] == '/') {
+                toErase.push_back(p);
+            }
+        }
+        for (const auto& p : toErase) {
+            auto f = fileTable.find(p);
+            if (f != fileTable.end() && !f->second.isDirectory && f->second.size > 0) {
+                freeSpace(f->second.offset, f->second.size);
+            }
+            fileTable.erase(f);
+        }
         saveToDisk();
         return true;
     }
@@ -253,9 +409,7 @@ public:
         return true;
     }
 
-    string getCurrentDirectory() const {
-        return currentDir;
-    }
+    string getCurrentDirectory() const { return currentDir; }
 
     bool fileExists(const string& name) {
         string normalized = normalizePath(name);
@@ -264,8 +418,9 @@ public:
 
     size_t getFileSize(const string& name) {
         string normalized = normalizePath(name);
-        if (!fileTable.count(normalized) || fileTable[normalized].isDirectory) return 0;
-        return fileTable[normalized].size;
+        auto it = fileTable.find(normalized);
+        if (it == fileTable.end() || it->second.isDirectory) return 0;
+        return it->second.size;
     }
 
     vector<FileEntry> getCurrentEntries() const {
@@ -289,8 +444,10 @@ public:
     void reset() {
         data.assign(SIZE, 0);
         fileTable.clear();
+        freeList.clear();
         createDirectoryEntry("/");
         currentDir = "/";
+        rebuildFreeList();
         saveToDisk();
     }
 
@@ -350,25 +507,21 @@ public:
         bool loadedOn = false;
         bool loadedOff = false;
 
-        // Load power on sound
         if (powerOnBuffer.loadFromFile(soundPath)) {
             cout << "Loaded power_on.ogg successfully\n";
             loadedOn = true;
         } else {
-            // Try WAV
             string wavPath = soundsPath + "/power_on.wav";
             if (powerOnBuffer.loadFromFile(wavPath)) {
                 cout << "Loaded power_on.wav successfully\n";
                 loadedOn = true;
             }
         }
-
         if (!loadedOn) {
             cout << "Warning: Could not load power_on sound, generating beep\n";
             generateBeep(powerOnBuffer, 440.0f, 0.3f);
         }
 
-        // Load power off sound
         if (powerOffBuffer.loadFromFile(soundOffPath)) {
             cout << "Loaded power_off.ogg successfully\n";
             loadedOff = true;
@@ -379,7 +532,6 @@ public:
                 loadedOff = true;
             }
         }
-
         if (!loadedOff) {
             cout << "Warning: Could not load power_off sound, generating beep\n";
             generateBeep(powerOffBuffer, 220.0f, 0.2f);
@@ -397,59 +549,39 @@ public:
     }
 
     void playPowerOn() {
-        if (!initialized) {
-            cout << "AudioManager not initialized\n";
-            return;
-        }
-
-        cout << "playPowerOn called\n";
+        if (!initialized) return;
         powerOnSound.stop();
         powerOnSound.setLooping(false);
         powerOnSound.setPlayingOffset(sf::seconds(0.0f));
         powerOnSound.play();
         powerOnPlaying = true;
-        cout << "Power on sound started, status: " << (int)powerOnSound.getStatus() << "\n";
     }
 
     void playPowerOff() {
-        if (!initialized) {
-            cout << "AudioManager not initialized\n";
-            return;
-        }
-
-        cout << "playPowerOff called\n";
+        if (!initialized) return;
         powerOnPlaying = false;
         powerOnSound.stop();
         powerOnSound.setLooping(false);
-
         powerOffSound.stop();
         powerOffSound.play();
-        cout << "Power off sound started, status: " << (int)powerOffSound.getStatus() << "\n";
     }
 
     void update() {
         if (!initialized || !powerOnPlaying) return;
-
         if (powerOnSound.getStatus() == sf::SoundSource::Status::Stopped) {
-            // The first pass is played in full. Every following pass starts at
-            // 20 seconds instead of repeating the intro.
             powerOnSound.setPlayingOffset(sf::seconds(powerOnLoopOffsetSeconds));
             powerOnSound.play();
-            cout << "Power on sound restarted from 20 seconds\n";
         }
     }
 
     void stopPowerOn() {
         if (!initialized) return;
-        cout << "stopPowerOn called\n";
         powerOnPlaying = false;
         powerOnSound.stop();
         powerOnSound.setLooping(false);
     }
 
-    bool isPowerOnPlaying() const {
-        return powerOnPlaying;
-    }
+    bool isPowerOnPlaying() const { return powerOnPlaying; }
 };
 
 // ============================================================
@@ -697,12 +829,32 @@ public:
                 }
             }
             else if (opcode == "PRINT") {
-                string arg; cmdStream >> arg;
-                if (arg[0] == '"' && arg.back() == '"') {
-                    output << arg.substr(1, arg.size()-2) << "\n";
+                // Читаем всё, что осталось после опкода PRINT, как одну строку.
+                string rest;
+                getline(cmdStream, rest);
+            
+                // Убираем ведущие пробелы
+                size_t start = rest.find_first_not_of(" \t");
+                if (start == string::npos) {
+                    output << "\n";
                 } else {
-                    uint16_t val = getValue(arg);
-                    output << "0x" << hex << val << " (" << dec << val << ")\n";
+                    rest = rest.substr(start);
+            
+                    // Если начинается с кавычки — это строковый литерал.
+                    if (!rest.empty() && rest[0] == '"') {
+                        // Ищем закрывающую кавычку
+                        size_t endQuote = rest.find('"', 1);
+                        if (endQuote != string::npos) {
+                            output << rest.substr(1, endQuote - 1) << "\n";
+                        } else {
+                            // Кавычка не закрыта — выводим как есть
+                            output << rest.substr(1) << "\n";
+                        }
+                    } else {
+                        // Иначе — число или регистр
+                        uint16_t val = getValue(rest);
+                        output << "0x" << hex << val << " (" << dec << val << ")\n";
+                    }
                 }
             }
             else if (opcode == "CLC") { CF = false; }
@@ -807,7 +959,6 @@ private:
     AudioManager audio;
     GLFWwindow* window = nullptr;
 
-    // Editor state
     string editor = "";
     string editorFileName;
     string outputBuffer = "";
@@ -934,7 +1085,6 @@ private:
             appendOutput("ERROR: No program to run\n");
             return;
         }
-
         statusBar = "EXECUTING";
         string result = cpu.executeProgram(editor);
         appendOutput("\n=== PROGRAM OUTPUT ===\n");
@@ -957,9 +1107,7 @@ private:
         editorLines.clear();
         istringstream iss(editor);
         string line;
-        while (getline(iss, line)) {
-            editorLines.push_back(line);
-        }
+        while (getline(iss, line)) editorLines.push_back(line);
         if (editorLines.empty()) editorLines.push_back("");
         cursorLine = min(cursorLine, (int)editorLines.size() - 1);
         cursorLine = max(0, cursorLine);
@@ -1004,12 +1152,8 @@ private:
 
     void rebuildEditor() {
         editor.clear();
-        for (const string& line : editorLines) {
-            editor += line + "\n";
-        }
-        if (!editor.empty() && editor.back() == '\n') {
-            editor.pop_back();
-        }
+        for (const string& line : editorLines) editor += line + "\n";
+        if (!editor.empty() && editor.back() == '\n') editor.pop_back();
     }
 
     void moveCursorUp() {
@@ -1027,18 +1171,16 @@ private:
     }
 
     void moveCursorLeft() {
-        if (cursorCol > 0) {
-            cursorCol--;
-        } else if (cursorLine > 0) {
+        if (cursorCol > 0) cursorCol--;
+        else if (cursorLine > 0) {
             cursorLine--;
             cursorCol = editorLines[cursorLine].length();
         }
     }
 
     void moveCursorRight() {
-        if (cursorCol < (int)editorLines[cursorLine].length()) {
-            cursorCol++;
-        } else if (cursorLine < (int)editorLines.size() - 1) {
+        if (cursorCol < (int)editorLines[cursorLine].length()) cursorCol++;
+        else if (cursorLine < (int)editorLines.size() - 1) {
             cursorLine++;
             cursorCol = 0;
         }
@@ -1074,8 +1216,26 @@ private:
 
     void saveProgram() {
         if (editorFileName.empty()) { createProgram(); return; }
-        if (disk.writeFile(editorFileName, editor)) appendOutput("Saved to HDD: " + editorFileName + "\n");
-        else appendOutput("ERROR: Could not save " + editorFileName + "\n");
+        if (disk.writeFile(editorFileName, editor))
+            appendOutput("Saved to HDD: " + editorFileName + "\n");
+        else
+            appendOutput("ERROR: Could not save " + editorFileName + " (disk full?)\n");
+    }
+
+    // Delete the currently selected entry in the browser.
+    void deleteSelected() {
+        auto entries = disk.getCurrentEntries();
+        if (entries.empty() || fileSelection >= (int)entries.size()) return;
+        const auto& entry = entries[fileSelection];
+        string name = disk.getName(entry.path);
+        bool ok = entry.isDirectory ? disk.deleteDirectory(entry.path)
+                                    : disk.deleteFile(entry.path);
+        if (ok) {
+            appendOutput(string("Deleted: ") + (entry.isDirectory ? "[DIR] " : "[ASM] ") + name + "\n");
+            fileSelection = max(0, fileSelection - 1);
+        } else {
+            appendOutput("ERROR: Could not delete " + name + "\n");
+        }
     }
 
     static void errorCallback(int, const char* description) {
@@ -1087,17 +1247,10 @@ private:
         auto* app = static_cast<TerminalInterface*>(glfwGetWindowUserPointer(window));
         if (!app) return;
 
-        if (key == GLFW_KEY_F11 || key == GLFW_KEY_P) {
-            app->togglePower();
-            return;
-        }
-
+        if (key == GLFW_KEY_F11) { app->togglePower(); return; }
         if (!app->isPowered || app->booting) return;
 
-        if (key == GLFW_KEY_F1) {
-            app->showHelp = !app->showHelp;
-            return;
-        }
+        if (key == GLFW_KEY_F1) { app->showHelp = !app->showHelp; return; }
         if (app->showHelp) {
             if (key == GLFW_KEY_ESCAPE || key == GLFW_KEY_ENTER) app->showHelp = false;
             return;
@@ -1120,59 +1273,45 @@ private:
             else if (key == GLFW_KEY_DOWN && !entries.empty()) app->fileSelection = min((int)entries.size() - 1, app->fileSelection + 1);
             else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) app->openSelectedFile();
             else if (key == GLFW_KEY_F4) app->createProgram();
-            else if (key == GLFW_KEY_BACKSPACE && app->disk.getCurrentDirectory() != "/") { app->disk.changeDirectory("/"); app->fileSelection = 0; }
+            else if (key == GLFW_KEY_F10 || key == GLFW_KEY_DELETE) app->deleteSelected();
+            else if (key == GLFW_KEY_BACKSPACE && app->disk.getCurrentDirectory() != "/") {
+                app->disk.changeDirectory("/"); app->fileSelection = 0;
+            }
             return;
         }
-        if (key == GLFW_KEY_F5) {
-            app->runProgram();
-        } else if (key == GLFW_KEY_F2) {
-            app->resetMachine();
-        } else if (key == GLFW_KEY_F3) {
-            app->appendOutput(app->disk.listFiles());
-        } else if (key == GLFW_KEY_F4) {
-            app->createProgram();
-        } else if (key == GLFW_KEY_F6) {
-            app->saveProgram();
-        } else if (key == GLFW_KEY_F7) {
-            app->screen = Screen::Browser;
-            app->showEditor = false;
-        } else if (key == GLFW_KEY_ESCAPE) {
-            app->screen = Screen::Browser;
-            app->showEditor = false;
-        } else if (key == GLFW_KEY_F8) {
+        // Editor / general shortcuts
+        if (key == GLFW_KEY_F5) app->runProgram();
+        else if (key == GLFW_KEY_F2) app->resetMachine();
+        else if (key == GLFW_KEY_F3) app->appendOutput(app->disk.listFiles());
+        else if (key == GLFW_KEY_F4) app->createProgram();
+        else if (key == GLFW_KEY_F6) app->saveProgram();
+        else if (key == GLFW_KEY_F7) { app->screen = Screen::Browser; app->showEditor = false; }
+        else if (key == GLFW_KEY_ESCAPE) { app->screen = Screen::Browser; app->showEditor = false; }
+        else if (key == GLFW_KEY_F8) {
             app->currentDir = app->disk.getCurrentDirectory();
             app->appendOutput("Current directory: " + app->currentDir + "\n");
-        } else if (key == GLFW_KEY_F9) {
+        }
+        else if (key == GLFW_KEY_F9) {
             string dir = "new_dir";
-            if (app->disk.createDirectory(dir)) {
+            if (app->disk.createDirectory(dir))
                 app->appendOutput("Created directory: " + dir + "\n");
-            }
-        } else if (key == GLFW_KEY_F10) {
-            if (!app->isPowered) return;
-            app->appendOutput("Use F11 or P to power off\n");
-        } else if (key == GLFW_KEY_BACKSPACE) {
-            app->deleteChar();
-        } else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) {
-            app->insertChar('\n');
-        } else if (key == GLFW_KEY_UP) {
-            app->moveCursorUp();
-        } else if (key == GLFW_KEY_DOWN) {
-            app->moveCursorDown();
-        } else if (key == GLFW_KEY_LEFT) {
-            app->moveCursorLeft();
-        } else if (key == GLFW_KEY_RIGHT) {
-            app->moveCursorRight();
-        } else if (key == GLFW_KEY_TAB) {
-            app->insertChar(' ');
-            app->insertChar(' ');
-            app->insertChar(' ');
-            app->insertChar(' ');
+        }
+        else if (key == GLFW_KEY_BACKSPACE) app->deleteChar();
+        else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) app->insertChar('\n');
+        else if (key == GLFW_KEY_UP) app->moveCursorUp();
+        else if (key == GLFW_KEY_DOWN) app->moveCursorDown();
+        else if (key == GLFW_KEY_LEFT) app->moveCursorLeft();
+        else if (key == GLFW_KEY_RIGHT) app->moveCursorRight();
+        else if (key == GLFW_KEY_TAB) {
+            app->insertChar(' '); app->insertChar(' ');
+            app->insertChar(' '); app->insertChar(' ');
         }
     }
 
     static void charCallback(GLFWwindow* window, unsigned int codepoint) {
         auto* app = static_cast<TerminalInterface*>(glfwGetWindowUserPointer(window));
-        if (!app || app->showHelp || !app->isPowered || app->booting || codepoint < 32 || codepoint > 126) return;
+        if (!app || app->showHelp || !app->isPowered || app->booting ||
+            codepoint < 32 || codepoint > 126) return;
         app->insertChar(static_cast<char>(codepoint));
     }
 
@@ -1203,8 +1342,9 @@ private:
             {'!',{0x04,0x04,0x04,0x04,0x04,0,0x04}}, {'>',{0x10,0x08,0x04,0x02,0x04,0x08,0x10}},
             {'<',{0x01,0x02,0x04,0x08,0x04,0x02,0x01}}, {'?',{0x0E,0x11,0x01,0x02,0x04,0,0x04}},
             {'(',{0x02,0x04,0x08,0x08,0x08,0x04,0x02}}, {')',{0x08,0x04,0x02,0x02,0x02,0x04,0x08}},
-            {',',{0,0,0,0,0x06,0x06,0x04}}, {';',{0,0x06,0x06,0,0x06,0x06,0x04}}, {'*',{0,0x15,0x0E,0x1F,0x0E,0x15,0}},
-            {'+',{0,0x04,0x04,0x1F,0x04,0x04,0}}, {'|',{0x04,0x04,0x04,0x04,0x04,0x04,0x04}}
+            {',',{0,0,0,0,0x06,0x06,0x04}}, {';',{0,0x06,0x06,0,0x06,0x06,0x04}},
+            {'*',{0,0x15,0x0E,0x1F,0x0E,0x15,0}}, {'+',{0,0x04,0x04,0x1F,0x04,0x04,0}},
+            {'|',{0x04,0x04,0x04,0x04,0x04,0x04,0x04}}
         };
         auto it = font.find(static_cast<char>(toupper(static_cast<unsigned char>(c))));
         return it == font.end() ? empty : it->second;
@@ -1223,7 +1363,8 @@ private:
             for (int row = 0; row < 7; ++row) for (int col = 0; col < 5; ++col)
                 if (glyph(c)[row] & (1 << (4 - col))) {
                     const float px = x + col * scale, py = y + row * scale;
-                    glVertex2f(px, py); glVertex2f(px + scale, py); glVertex2f(px + scale, py + scale); glVertex2f(px, py + scale);
+                    glVertex2f(px, py); glVertex2f(px + scale, py);
+                    glVertex2f(px + scale, py + scale); glVertex2f(px, py + scale);
                 }
             x += advance;
         }
@@ -1235,10 +1376,7 @@ private:
         istringstream stream(value);
         string line;
         while (getline(stream, line) && lines.size() < maxLines) {
-            if (line.empty()) {
-                lines.push_back(" ");
-                continue;
-            }
+            if (line.empty()) { lines.push_back(" "); continue; }
             while (!line.empty() && line.back() == ' ') line.pop_back();
             if (line.empty()) { lines.push_back(" "); continue; }
 
@@ -1271,9 +1409,8 @@ private:
             text(x + 2 * scale, lineY, lineNum, scale * 0.7f, 0.3f, 0.5f, 0.3f);
 
             string displayLine = editorLines[i];
-            if ((int)displayLine.length() > maxCols) {
+            if ((int)displayLine.length() > maxCols)
                 displayLine = displayLine.substr(0, maxCols);
-            }
             text(x + numWidth + 2 * scale, lineY, displayLine, scale, 0.4f, 0.95f, 0.55f);
             lineY += lineHeight;
         }
@@ -1290,38 +1427,25 @@ private:
         float deltaTime = static_cast<float>(currentTime - lastUpdateTime);
         lastUpdateTime = currentTime;
 
-        // Update audio
         audio.update();
 
-        // Handle power on sound - запускаем сразу при начале загрузки
         if (booting && !powerOnSoundPlayed) {
             audio.playPowerOn();
             powerOnSoundPlayed = true;
         }
-
-        // While shutting down, the current state is still powered on until the
-        // animation completes.  Checking for !isPowered here caused the power-off
-        // sound to be played during the power-on animation, which immediately
-        // stopped the startup sound.
         if (animating && isPowered && !powerOffSoundPlayed) {
             audio.playPowerOff();
             powerOffSoundPlayed = true;
         }
 
-        // Update animations
         if (animating) {
             if (isPowered) {
                 powerAnimation -= animationSpeed;
-                if (powerAnimation <= 0.0f) {
-                    powerAnimation = 0.0f;
-                    completePowerToggle();
-                }
+                if (powerAnimation <= 0.0f) { powerAnimation = 0.0f; completePowerToggle(); }
             } else {
                 powerAnimation += animationSpeed;
                 if (powerAnimation >= 1.0f) {
                     powerAnimation = 1.0f;
-                    // Keep the boot screen active after the CRT has powered on.
-                    // The system becomes available only when the boot sequence ends.
                     isPowered = true;
                     cpu.setPowered(true);
                     animating = false;
@@ -1337,16 +1461,13 @@ private:
                 bootMessageIndex++;
                 bootMessageTimer = 0.0f;
             }
-            if (bootProgress >= 1.0f) {
-                completeBoot();
-            }
+            if (bootProgress >= 1.0f) completeBoot();
         }
 
         glViewport(0, 0, width, height);
         glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, width, height, 0, -1, 1);
         glMatrixMode(GL_MODELVIEW); glLoadIdentity();
 
-        // Background
         glClearColor(0.055f, 0.035f, 0.022f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
@@ -1361,22 +1482,17 @@ private:
         const float screenW = caseW - 2 * bezel, screenH = 500 * scale;
         const bool shuttingDown = animating && isPowered && !booting;
 
-        // Case
         rect(caseX + 16 * scale, caseY + 20 * scale, caseW, caseH, 0.025f, 0.014f, 0.008f, 0.72f);
         rect(caseX, caseY, caseW, caseH, 0.62f, 0.47f, 0.28f);
         rect(caseX + 10 * scale, caseY + 10 * scale, caseW - 20 * scale, caseH - 20 * scale, 0.78f, 0.63f, 0.39f);
         rect(screenX - 16 * scale, screenY - 16 * scale, screenW + 32 * scale, screenH + 32 * scale, 0.13f, 0.10f, 0.055f);
         rect(screenX - 7 * scale, screenY - 7 * scale, screenW + 14 * scale, screenH + 14 * scale, 0.025f, 0.035f, 0.026f);
 
-        // Screen
         float brightness = isPowered ? (1.0f - powerAnimation * 0.5f) : (0.1f + powerAnimation * 0.3f);
         if (booting) brightness = bootProgress * 0.9f + 0.1f;
         if (shuttingDown) brightness = max(0.05f, powerAnimation);
 
-        float screenR = 0.0f * brightness;
-        float screenG = 0.075f * brightness;
-        float screenB = 0.039f * brightness;
-        rect(screenX, screenY, screenW, screenH, screenR, screenG, screenB);
+        rect(screenX, screenY, screenW, screenH, 0.0f, 0.075f * brightness, 0.039f * brightness);
 
         if (booting || !isPowered || (powerAnimation < 0.3f && !shuttingDown)) {
             float alpha = booting ? 1.0f : (isPowered ? 1.0f - powerAnimation * 3.0f : 1.0f);
@@ -1392,7 +1508,7 @@ private:
 
             if (!isPowered && powerAnimation < 0.5f) {
                 text(screenX + screenW/2 - 100 * scale, screenY + screenH/2 + 20 * scale,
-                     "[F11 or P to power on]", 1.0f * scale, 0.2f, 0.2f, 0.2f);
+                     "[F11 to power on]", 1.0f * scale, 0.2f, 0.2f, 0.2f);
             }
 
             if (booting) {
@@ -1430,7 +1546,6 @@ private:
                      0.85f * scale, 0.3f, 0.75f, 0.4f);
             }
         } else {
-            // Active screen
             for (int y = static_cast<int>(screenY); y < screenY + screenH; y += max(2, static_cast<int>(4 * scale)))
                 rect(screenX, static_cast<float>(y), screenW, 1, 0.0f, 0.0f, 0.0f, 0.25f);
             rect(screenX, screenY, screenW, 2 * scale, 0.15f, 0.95f, 0.52f, 0.45f);
@@ -1442,38 +1557,54 @@ private:
                  terminalScale * 0.9f, 0.48f, 1.0f, 0.62f);
 
             text(screenX + 18 * scale, screenY + 38 * scale,
-                 screen == Screen::Editor ? "F5 RUN  F6 SAVE  F7 FILES  ESC BACK  F1 HELP  F11 POWER" :
-                "ENTER SELECT  ARROWS MOVE  F4 NEW  ESC BACK  F1 HELP  F11 POWER",
+                 screen == Screen::Editor
+                     ? "F5 RUN  F6 SAVE  F7 FILES  ESC BACK  F1 HELP  F11 POWER"
+                     : "ENTER SELECT  ARROWS MOVE  F4 NEW  F10 DEL  ESC BACK  F1 HELP  F11 POWER",
                  terminalScale * 0.7f, 0.26f, 0.72f, 0.39f);
 
             float contentY = screenY + 58 * scale;
             float contentH = screenH - 100 * scale;
 
-            float editorH = contentH * 0.6f;
-            float outputH = contentH * 0.4f;
-
             if (screen == Screen::Menu) {
                 const array<string, 3> menu = { "BROWSE PROGRAMS", "CREATE PROGRAM", "DISK INFORMATION" };
-                text(screenX + 38 * scale, contentY + 22 * scale, "CPU-16 SYSTEM MENU", terminalScale * 1.35f, 0.48f, 1.0f, 0.62f);
-                text(screenX + 38 * scale, contentY + 48 * scale, "DRIVE C: 10 MB HARD DISK", terminalScale * 0.75f, 0.28f, 0.72f, 0.39f);
+                text(screenX + 38 * scale, contentY + 22 * scale, "CPU-16 SYSTEM MENU",
+                     terminalScale * 1.35f, 0.48f, 1.0f, 0.62f);
+                text(screenX + 38 * scale, contentY + 48 * scale, "DRIVE C: 10 MB HARD DISK",
+                     terminalScale * 0.75f, 0.28f, 0.72f, 0.39f);
                 for (int i = 0; i < 3; ++i) {
                     float y = contentY + (82 + i * 38) * scale;
-                    if (i == menuSelection) rect(screenX + 26 * scale, y - 4 * scale, screenW - 52 * scale, 25 * scale, 0.08f, 0.34f, 0.16f, 0.7f);
-                    text(screenX + 42 * scale, y, string(i == menuSelection ? "> " : "  ") + menu[i], terminalScale, 0.42f, 0.96f, 0.54f);
+                    if (i == menuSelection)
+                        rect(screenX + 26 * scale, y - 4 * scale, screenW - 52 * scale, 25 * scale,
+                             0.08f, 0.34f, 0.16f, 0.7f);
+                    text(screenX + 42 * scale, y, string(i == menuSelection ? "> " : "  ") + menu[i],
+                         terminalScale, 0.42f, 0.96f, 0.54f);
                 }
-                text(screenX + 38 * scale, contentY + contentH - 25 * scale, "SELECT AN ITEM TO MANAGE PROGRAMS ON DISC_C.BIN", terminalScale * 0.65f, 0.28f, 0.62f, 0.34f);
+                text(screenX + 38 * scale, contentY + contentH - 25 * scale,
+                     "SELECT AN ITEM TO MANAGE PROGRAMS ON DISC_C.BIN",
+                     terminalScale * 0.65f, 0.28f, 0.62f, 0.34f);
             } else if (screen == Screen::Browser) {
-                text(screenX + 30 * scale, contentY + 16 * scale, "C: " + disk.getCurrentDirectory(), terminalScale, 0.48f, 1.0f, 0.62f);
+                text(screenX + 30 * scale, contentY + 16 * scale, "C: " + disk.getCurrentDirectory(),
+                     terminalScale, 0.48f, 1.0f, 0.62f);
                 auto entries = disk.getCurrentEntries();
-                if (entries.empty()) text(screenX + 44 * scale, contentY + 52 * scale, "< EMPTY DIRECTORY >", terminalScale, 0.32f, 0.62f, 0.37f);
+                if (entries.empty())
+                    text(screenX + 44 * scale, contentY + 52 * scale, "< EMPTY DIRECTORY >",
+                         terminalScale, 0.32f, 0.62f, 0.37f);
                 for (size_t i = 0; i < entries.size() && i < 10; ++i) {
                     float y = contentY + (48 + i * 27) * scale;
-                    if ((int)i == fileSelection) rect(screenX + 24 * scale, y - 3 * scale, screenW - 48 * scale, 21 * scale, 0.08f, 0.34f, 0.16f, 0.7f);
+                    if ((int)i == fileSelection)
+                        rect(screenX + 24 * scale, y - 3 * scale, screenW - 48 * scale, 21 * scale,
+                             0.08f, 0.34f, 0.16f, 0.7f);
                     string name = disk.getName(entries[i].path);
-                    string label = entries[i].isDirectory ? "[DIR]  " + name : "[ASM]  " + name + "  " + to_string(entries[i].size) + " BYTES";
-                    text(screenX + 38 * scale, y, string((int)i == fileSelection ? "> " : "  ") + label, terminalScale * 0.85f, 0.42f, 0.96f, 0.54f);
+                    string label = entries[i].isDirectory
+                        ? "[DIR]  " + name
+                        : "[ASM]  " + name + "  " + to_string(entries[i].size) + " BYTES";
+                    text(screenX + 38 * scale, y,
+                         string((int)i == fileSelection ? "> " : "  ") + label,
+                         terminalScale * 0.85f, 0.42f, 0.96f, 0.54f);
                 }
-                text(screenX + 30 * scale, contentY + contentH - 25 * scale, "ENTER OPEN   F4 NEW PROGRAM   ESC MENU", terminalScale * 0.65f, 0.28f, 0.62f, 0.34f);
+                text(screenX + 30 * scale, contentY + contentH - 25 * scale,
+                     "ENTER OPEN   F4 NEW   F10 DEL   ESC MENU",
+                     terminalScale * 0.65f, 0.28f, 0.62f, 0.34f);
             } else if (showHelp) {
                 string help =
                     "=== CPU-16 HELP ===\n\n"
@@ -1485,7 +1616,8 @@ private:
                     "F7     Return to file browser\n"
                     "F8     Show current directory\n"
                     "F9     Create new directory\n"
-                    "F11/P  Toggle power\n"
+                    "F10    Delete selected (in browser)\n"
+                    "F11    Toggle power\n"
                     "F1     Toggle help\n"
                     "ESC    Close help\n\n"
                     "Arrow keys to navigate\n"
@@ -1497,17 +1629,19 @@ private:
                     y += 9 * terminalScale;
                 }
             } else {
-                // Editor area
+                float editorH = contentH * 0.5f;
+                float outputH = contentH * 0.5f;
+
                 rect(screenX + 10 * scale, contentY, screenW - 20 * scale, editorH, 0.0f, 0.03f, 0.01f, 0.5f);
                 drawEditor(screenX + 10 * scale, contentY + 2 * scale,
                           screenW - 20 * scale, editorH - 4 * scale, terminalScale * 0.8f);
 
-                // Separator
-                rect(screenX + 10 * scale, contentY + editorH, screenW - 20 * scale, 2 * scale, 0.2f, 0.6f, 0.2f, 0.5f);
+                rect(screenX + 10 * scale, contentY + editorH, screenW - 20 * scale, 2 * scale,
+                     0.2f, 0.6f, 0.2f, 0.5f);
 
-                // Output area
                 float outputY = contentY + editorH + 4 * scale;
-                rect(screenX + 10 * scale, outputY, screenW - 20 * scale, outputH - 4 * scale, 0.0f, 0.02f, 0.01f, 0.5f);
+                rect(screenX + 10 * scale, outputY, screenW - 20 * scale, outputH - 4 * scale,
+                     0.0f, 0.02f, 0.01f, 0.5f);
 
                 string displayOutput = outputBuffer;
                 if (displayOutput.length() > 500) {
@@ -1531,44 +1665,60 @@ private:
             const float topEdge = lineY - visibleHeight * 0.5f;
             const float bottomEdge = lineY + visibleHeight * 0.5f;
             const float glow = 0.35f + 0.65f * (1.0f - collapse);
-
-            // Collapse the CRT image toward its centre line, leaving a short
-            // phosphor flash before the screen becomes fully dark.
-            rect(screenX, screenY, screenW, max(0.0f, topEdge - screenY), 0.0f, 0.0f, 0.0f, 0.96f);
-            rect(screenX, bottomEdge, screenW, max(0.0f, screenY + screenH - bottomEdge),
-                 0.0f, 0.0f, 0.0f, 0.96f);
-            rect(screenX, topEdge, screenW, visibleHeight, 0.0f, 0.0f, 0.0f, shutdownProgress * 0.7f);
-            rect(screenX, lineY - scale, screenW, 2.0f * scale, 0.35f * glow, 1.0f * glow, 0.55f * glow);
-
+        
+            // Небольшой запас по пикселям, чтобы точно перекрыть края.
+            const float overlap = 4.0f;
+        
+            // alpha = 1.0 — полностью непрозрачный чёрный.
+            rect(screenX,
+                 screenY - overlap,
+                 screenW,
+                 max(0.0f, (topEdge - screenY) + overlap),
+                 0.0f, 0.0f, 0.0f, 1.0f);
+        
+            rect(screenX,
+                 bottomEdge,
+                 screenW,
+                 max(0.0f, (screenY + screenH - bottomEdge) + overlap),
+                 0.0f, 0.0f, 0.0f, 1.0f);
+        
+            rect(screenX, topEdge, screenW, visibleHeight,
+                 0.0f, 0.0f, 0.0f, shutdownProgress * 0.7f);
+        
+            rect(screenX, lineY - scale, screenW, 2.0f * scale,
+                 0.35f * glow, 1.0f * glow, 0.55f * glow);
+        
             if (shutdownProgress < 0.55f) {
                 text(screenX + screenW * 0.5f - 54 * scale, lineY - 26 * scale,
                      "SYSTEM HALT", 1.1f * scale, 0.3f * glow, 0.9f * glow, 0.45f * glow);
             }
         }
 
-        // Physical details
-        rect(caseX + 34 * scale, caseY + caseH - 120 * scale, 250 * scale, 42 * scale, 0.48f, 0.35f, 0.20f);
-        text(caseX + 48 * scale, caseY + caseH - 107 * scale, "A R C A D E  1 6", 1.3f * scale, 0.12f, 0.09f, 0.05f);
-        text(caseX + 48 * scale, caseY + caseH - 91 * scale, "PERSONAL COMPUTER", 0.85f * scale, 0.12f, 0.09f, 0.05f);
+        rect(caseX + 34 * scale, caseY + caseH - 120 * scale, 250 * scale, 42 * scale,
+             0.48f, 0.35f, 0.20f);
+        text(caseX + 48 * scale, caseY + caseH - 107 * scale, "A R C A D E  1 6",
+             1.3f * scale, 0.12f, 0.09f, 0.05f);
+        text(caseX + 48 * scale, caseY + caseH - 91 * scale, "PERSONAL COMPUTER",
+             0.85f * scale, 0.12f, 0.09f, 0.05f);
         for (int i = 0; i < 5; ++i)
-            rect(caseX + 38 * scale + i * 10 * scale, caseY + caseH - 55 * scale, 6 * scale, 3 * scale, 0.18f, 0.13f, 0.07f);
+            rect(caseX + 38 * scale + i * 10 * scale, caseY + caseH - 55 * scale,
+                 6 * scale, 3 * scale, 0.18f, 0.13f, 0.07f);
 
-        // Power LED
         float ledBrightness = isPowered ? 1.0f : 0.2f;
-        rect(caseX + caseW - 104 * scale, caseY + caseH - 108 * scale, 52 * scale, 26 * scale, 0.18f, 0.13f, 0.07f);
+        rect(caseX + caseW - 104 * scale, caseY + caseH - 108 * scale, 52 * scale, 26 * scale,
+             0.18f, 0.13f, 0.07f);
         rect(caseX + caseW - 97 * scale, caseY + caseH - 101 * scale, 12 * scale, 12 * scale,
              0.22f * ledBrightness, 0.95f * ledBrightness, 0.31f * ledBrightness);
         rect(caseX + caseW - 100 * scale, caseY + caseH - 104 * scale, 18 * scale, 18 * scale,
              0.15f * ledBrightness, 0.5f * ledBrightness, 0.2f * ledBrightness, 0.3f);
-        text(caseX + caseW - 166 * scale, caseY + caseH - 68 * scale, "POWER", 0.9f * scale, 0.18f, 0.13f, 0.07f);
+        text(caseX + caseW - 166 * scale, caseY + caseH - 68 * scale, "POWER",
+             0.9f * scale, 0.18f, 0.13f, 0.07f);
 
-        // Footer: keep the control legend safely above the lower window edge.
-        // Lift the footer by roughly three text rows to prevent clipping on
-        // shorter displays and at larger UI scales.
         const float footerY = caseY + caseH - 44 * scale;
-        rect(caseX + 122 * scale, footerY, caseW - 244 * scale, 54 * scale, 0.43f, 0.32f, 0.19f);
+        rect(caseX + 122 * scale, footerY, caseW - 244 * scale, 54 * scale,
+             0.43f, 0.32f, 0.19f);
         text(caseX + 150 * scale, footerY + 18 * scale,
-             "[F11/P] POWER  [F5] RUN  [F2] RESET  [F1] HELP",
+             "[F11] POWER  [F5] RUN  [F2] RESET  [F1] HELP",
              1.35f * scale, 0.76f, 0.64f, 0.40f);
     }
 
@@ -1594,7 +1744,6 @@ public:
         glfwSetKeyCallback(window, keyCallback);
         glfwSetCharCallback(window, charCallback);
 
-        // Initial state: powered off
         isPowered = false;
         cpu.setPowered(false);
         statusBar = "OFFLINE";
@@ -1627,21 +1776,19 @@ int main() {
     cout << "Executable path: " << getExecutablePath() << "\n";
     cout << "Sounds path: " << getSoundsPath() << "\n";
 
-    // List files in sounds directory
     string soundsPath = getSoundsPath();
     fs::path sp(soundsPath);
     if (fs::exists(sp)) {
         cout << "Files in sounds directory:\n";
-        for (const auto& entry : fs::directory_iterator(sp)) {
+        for (const auto& entry : fs::directory_iterator(sp))
             cout << "  " << entry.path().filename().string() << "\n";
-        }
     } else {
         cout << "Sounds directory does not exist!\n";
-        if (fs::create_directory(sp)) {
-            cout << "Created sounds directory\n";
-        }
+        if (fs::create_directory(sp)) cout << "Created sounds directory\n";
     }
 
     TerminalInterface terminal;
     return terminal.run();
 }
+
+//g++ -std=c++17 -O2 main.cpp -o cpu_emu.exe -lglfw3 -lopengl32 -lgdi32 -lsfml-audio -lsfml-system -Wno-stringop-overflow
