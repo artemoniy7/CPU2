@@ -16,6 +16,13 @@ std::string trim(const std::string& value) {
     return value.substr(first, last - first + 1);
 }
 
+bool validHostname(const std::string& value) {
+    if (value.empty() || value.size() > 32) return false;
+    return std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+        return std::isalnum(ch) || ch == '-' || ch == '_';
+    });
+}
+
 bool validLogPath(const std::string& value) {
     if (value.empty() || value.size() > 240) return false;
     return value.find_first_of("\r\n") == std::string::npos;
@@ -73,7 +80,7 @@ bool ConfigManager::load(ServerState& state, std::string& error) {
         error = "Invalid log_file value in configuration.";
         return false;
     }
-    if (!state.setHostname(hostname)) {
+    if (!validHostname(hostname)) {
         error = "Invalid hostname in configuration (1-32 letters, digits, '-' or '_').";
         return false;
     }
@@ -82,6 +89,7 @@ bool ConfigManager::load(ServerState& state, std::string& error) {
         error = "Configuration loaded, but the log file cannot be accessed: " + logFile;
         return false;
     }
+    state.setHostname(hostname);
     error.clear();
     state.addLog("Configuration loaded from " + path_ + ".");
     return true;
