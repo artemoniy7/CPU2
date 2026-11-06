@@ -15,6 +15,7 @@ add_library(cpu16_server_vm
     src/vm/Memory.cpp
     src/vm/DeviceBus.cpp
     src/vm/VirtualMachine.cpp
+    src/vm/Cpu16Core.cpp
 )
 target_include_directories(cpu16_server_vm PUBLIC include)
 target_compile_features(cpu16_server_vm PUBLIC cxx_std_17)
@@ -39,4 +40,10 @@ if(BUILD_TESTING)
     )
     target_link_libraries(cpu16_server_vm_tests PRIVATE cpu16_server_vm)
     add_test(NAME cpu16_server_vm_tests COMMAND cpu16_server_vm_tests)
+
+    add_executable(cpu16_server_cpu_tests
+        tests/Cpu16CoreTests.cpp
+    )
+    target_link_libraries(cpu16_server_cpu_tests PRIVATE cpu16_server_vm)
+    add_test(NAME cpu16_server_cpu_tests COMMAND cpu16_server_cpu_tests)
 endif()
