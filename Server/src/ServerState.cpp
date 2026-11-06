@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <system_error>
+#include <utility>
 
 namespace {
 constexpr std::size_t MaxMemoryLogEntries = 100;
