@@ -19,7 +19,7 @@ int main(){
   if(!catalog.find("test-vm",loaded,&error))throw std::runtime_error(error);
   if(loaded.config.ramSizeBytes!=record.config.ramSizeBytes)throw std::runtime_error("RAM config mismatch");
   cpu16::storage::DiskImage image;
-  if(!image.open(root/"disks"/record.diskImage,&error))throw std::runtime_error(error);
+  if(!image.open(root/"disks"/loaded.diskImage,&error))throw std::runtime_error(error);
   std::vector<std::uint8_t> sector(512,0x5A);
   if(!image.writeSector(7,sector,&error))throw std::runtime_error(error);
   if(!image.flush(&error))throw std::runtime_error(error);
