@@ -70,6 +70,14 @@ The VM can execute CPU16 bytecode when a `Cpu16Core` is installed and a program 
 
 Not implemented yet: a disk controller/block device, persistent disk-image container, default console/keyboard devices, boot ROM/bootloader, a bootable Server OS, guest filesystem, guest process model, full guest TCP/IP stack, physical LAN transport, or Desktop reuse of the shared server core.
 
+## Server Manager and persistent storage
+
+The standalone `cpu16-server` host program is the first management entry point. It provisions machine records under a host-side data directory (`cpu16-server-data`) and creates an opaque CPU16 disk image for each new VM. The manager can list, create and inspect machine definitions. Machine records contain a machine ID, display name, CPU model, RAM capacity, cycle-slice budget and virtual disk capacity.
+
+The disk image format has a 512-byte header and a raw sector area. Guest-facing storage is represented by a block-device interface; the host path is used only by the emulator to persist opaque sector bytes. The guest OS must implement its own partition/filesystem format on top of those sectors. Reads and writes are bounded by the image's sector count, and the image header is versioned.
+
+This first manager is a command-line control surface, not yet the requested graphical desktop UI. It deliberately does not claim that machines can boot: the boot firmware/loader, device drivers and guest OS are still future work. A graphical CPU16 Server Manager should call the same catalog/runtime APIs rather than implement hardware itself.
+
 ## Development phases
 
 1. **VM hardware and CPU16 bytecode core** — configurable RAM, existing compiled-bytecode execution semantics, device bus, cycle runner and tests.
