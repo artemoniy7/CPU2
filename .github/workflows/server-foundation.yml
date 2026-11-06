@@ -1,0 +1,30 @@
+name: Server foundation
+
+on:
+  push:
+    branches: [feature/server-vm-foundation]
+    paths:
+      - "Server/**"
+      - ".github/workflows/server-foundation.yml"
+  pull_request:
+    paths:
+      - "Server/**"
+      - ".github/workflows/server-foundation.yml"
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S Server -B build-server -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build-server --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build-server -C Release --output-on-failure
