@@ -26,10 +26,22 @@ add_executable(cpu16-server src/manager/main.cpp)
 target_link_libraries(cpu16-server PRIVATE cpu16_server_vm)
 target_compile_features(cpu16-server PRIVATE cxx_std_17)
 
+# The first graphical manager uses the native Windows desktop API. The
+# portable server core and CLI remain available on Linux and other hosts.
+if(WIN32)
+    add_executable(cpu16-server-manager WIN32 src/manager/ServerManagerGui.cpp)
+    target_link_libraries(cpu16-server-manager PRIVATE cpu16_server_vm comctl32 shell32)
+    target_compile_features(cpu16-server-manager PRIVATE cxx_std_17)
+    target_compile_definitions(cpu16-server-manager PRIVATE UNICODE _UNICODE)
+endif()
+
 if(MSVC)
     target_compile_options(cpu16_server_network PRIVATE /W4 /permissive-)
     target_compile_options(cpu16_server_vm PRIVATE /W4 /permissive-)
     target_compile_options(cpu16-server PRIVATE /W4 /permissive-)
+    if(WIN32)
+        target_compile_options(cpu16-server-manager PRIVATE /W4 /permissive-)
+    endif()
 else()
     target_compile_options(cpu16_server_network PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(cpu16_server_vm PRIVATE -Wall -Wextra -Wpedantic)
