@@ -22,7 +22,7 @@ public:
 
     ServerMode mode() const noexcept;
     bool running() const noexcept;
-    void requestShutdown() noexcept;
+    void requestShutdown();
     std::string modeName() const;
 
     const std::string& hostname() const noexcept;
@@ -30,7 +30,7 @@ public:
     long long uptimeSeconds() const noexcept;
 
     const std::vector<ServiceInfo>& services() const noexcept;
-    ServiceInfo* findService(const std::string& name) noexcept;
+    ServiceInfo* findService(const std::string& name);
     void addLog(const std::string& message);
     const std::vector<std::string>& log() const noexcept;
 
