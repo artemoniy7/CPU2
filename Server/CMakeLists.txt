@@ -4,6 +4,7 @@ project(CPU16Server LANGUAGES CXX)
 include(CTest)
 
 add_library(cpu16_server_network
+    src/network/NetworkTypes.cpp
     src/network/VirtualNetwork.cpp
 )
 target_include_directories(cpu16_server_network PUBLIC include)
