@@ -39,7 +39,7 @@ cmake --build build-server --config Release
 ./build-server/cpu16-server info node01
 ```
 
-On Windows, run `build-server\\Release\\cpu16-server.exe` when using a multi-configuration generator. The manager stores host-side machine metadata and opaque disk images in `cpu16-server-data/` under the working directory. Each newly provisioned VM gets a 512 MiB disk by default.
+On Windows, run `build-server\\Release\\cpu16-server.exe` when using a multi-configuration generator. The manager stores host-side machine metadata and opaque disk images in `cpu16-server-data/` under the working directory. Each newly provisioned VM gets a 64 MiB disk by default, with a unique image filename.
 
 This is the first management interface (CLI). The graphical Server Manager window is a separate next step; the catalog and storage APIs are designed to be reused by it.
 
