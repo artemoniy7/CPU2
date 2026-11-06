@@ -31,7 +31,6 @@ ServerState::ServerState(ServerMode mode)
     services_.push_back({"SPOOLER", "Print queue service (placeholder)", false, false});
     services_.push_back({"HTTPD", "HTTP server service (placeholder)", false, false});
     services_.push_back({"FTPD", "File transfer service (placeholder)", false, false});
-    addLog("System booted in " + modeName() + " mode.");
 }
 
 ServerMode ServerState::mode() const noexcept { return mode_; }
