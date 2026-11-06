@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ConfigManager.h"
 #include "ServerState.h"
 
 #include <string>
@@ -7,7 +8,7 @@
 
 class ServerShell {
 public:
-    explicit ServerShell(ServerState& state);
+    ServerShell(ServerState& state, ConfigManager& config);
     void run();
 
 private:
@@ -16,8 +17,11 @@ private:
     void printStatus() const;
     void printServices() const;
     void executeService(const std::vector<std::string>& args);
+    void executeConfig(const std::vector<std::string>& args);
+    void executeLog(const std::vector<std::string>& args);
     static std::vector<std::string> tokenize(const std::string& line);
     static std::string upper(std::string value);
 
     ServerState& state_;
+    ConfigManager& config_;
 };
