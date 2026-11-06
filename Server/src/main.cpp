@@ -31,6 +31,7 @@ int main(int argc, char* argv[]) {
     } else if (!configMessage.empty()) {
         std::cout << configMessage << "\n";
     }
+    state.addLog("System booted in " + state.modeName() + " mode.");
     if (!state.loggingAvailable()) {
         std::cerr << "Warning: persistent event logging is unavailable.\n";
     }
