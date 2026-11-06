@@ -15,7 +15,7 @@ ServerState::ServerState(ServerMode mode)
 ServerMode ServerState::mode() const noexcept { return mode_; }
 bool ServerState::running() const noexcept { return running_; }
 
-void ServerState::requestShutdown() noexcept {
+void ServerState::requestShutdown() {
     addLog("Shutdown requested.");
     running_ = false;
 }
@@ -45,7 +45,7 @@ const std::vector<ServiceInfo>& ServerState::services() const noexcept {
     return services_;
 }
 
-ServiceInfo* ServerState::findService(const std::string& name) noexcept {
+ServiceInfo* ServerState::findService(const std::string& name) {
     for (auto& service : services_) {
         std::string a = service.name;
         std::string b = name;
