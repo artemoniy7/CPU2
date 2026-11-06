@@ -5,6 +5,7 @@ add_executable(cpu_server
     src/main.cpp
     src/ServerShell.cpp
     src/ServerState.cpp
+    src/ConfigManager.cpp
 )
 
 target_include_directories(cpu_server PRIVATE include)
