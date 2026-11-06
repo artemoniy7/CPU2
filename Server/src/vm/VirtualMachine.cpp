@@ -1,16 +1,25 @@
 #include "vm/VirtualMachine.h"
 
+#include <limits>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace cpu16::vm {
+namespace {
+
+std::size_t checkedRamSize(const MachineConfig& config) {
+    std::string error;
+    if (!config.isValid(&error)) throw std::invalid_argument(error);
+    if (config.ramSizeBytes > std::numeric_limits<std::size_t>::max())
+        throw std::invalid_argument("RAM size is not addressable on this host");
+    return static_cast<std::size_t>(config.ramSizeBytes);
+}
+
+} // namespace
 
 VirtualMachine::VirtualMachine(MachineConfig config)
-    : config_(std::move(config)),
-      memory_(static_cast<std::size_t>(config_.ramSizeBytes)) {
-    std::string error;
-    if (!config_.isValid(&error)) throw std::invalid_argument(error);
-}
+    : config_(std::move(config)), memory_(checkedRamSize(config_)) {}
 
 const MachineConfig& VirtualMachine::config() const noexcept { return config_; }
 Memory& VirtualMachine::memory() noexcept { return memory_; }
@@ -39,8 +48,8 @@ RunResult VirtualMachine::runFor(std::uint64_t cycleBudget) {
     std::uint64_t executed = 0;
     while (executed < cycleBudget) {
         const CpuStepResult step = cpu_->step(memory_, devices_);
+        ++executed;
         if (step.state != CpuStepState::Continue) {
-            ++executed;
             totalCycles_ += executed;
             switch (step.state) {
                 case CpuStepState::Halted: return {RunState::Halted, executed, step.message};
@@ -49,7 +58,6 @@ RunResult VirtualMachine::runFor(std::uint64_t cycleBudget) {
                 case CpuStepState::Continue: break;
             }
         }
-        ++executed;
     }
 
     totalCycles_ += executed;
