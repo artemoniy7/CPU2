@@ -30,7 +30,7 @@ target_compile_features(cpu16-server PRIVATE cxx_std_17)
 # portable server core and CLI remain available on Linux and other hosts.
 if(WIN32)
     add_executable(cpu16-server-manager WIN32 src/manager/ServerManagerGui.cpp)
-    target_link_libraries(cpu16-server-manager PRIVATE cpu16_server_vm comctl32 shell32)
+    target_link_libraries(cpu16-server-manager PRIVATE cpu16_server_vm comctl32 user32 gdi32)
     target_compile_features(cpu16-server-manager PRIVATE cxx_std_17)
     target_compile_definitions(cpu16-server-manager PRIVATE UNICODE _UNICODE)
 endif()
