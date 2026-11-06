@@ -28,7 +28,8 @@ void Cpu16Core::reset() {
 
 bool Cpu16Core::loadBytecode(Memory& memory, const std::vector<std::uint8_t>& code,
                              std::uint16_t entryPoint, std::uint16_t loadAddress) {
-    if (code.empty() || code.size() % 7U != 0 || entryPoint >= code.size())
+    if (code.empty() || code.size() % 7U != 0 ||
+        code.size() > 65535U || entryPoint >= code.size())
         return false;
     if (!memory.load(loadAddress, code)) return false;
 
@@ -102,8 +103,10 @@ std::uint16_t Cpu16Core::readWord(const Memory& memory, std::uint32_t address) c
 
 void Cpu16Core::writeWord(Memory& memory, std::uint32_t address,
                           std::uint16_t value) noexcept {
-    if (address >= 0xF0000U && address < 0x100000U) return;
-    memory.write16(address, value);
+    if (address < 0xF0000U || address >= 0x100000U)
+        memory.write8(address, static_cast<std::uint8_t>(value & 0xFFU));
+    if (address + 1U < 0xF0000U || address + 1U >= 0x100000U)
+        memory.write8(address + 1U, static_cast<std::uint8_t>((value >> 8U) & 0xFFU));
 }
 
 void Cpu16Core::setFlagsForResult(std::uint16_t result, std::uint16_t lhs,
