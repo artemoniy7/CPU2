@@ -43,19 +43,39 @@ Both modes must preserve the same guest-visible addressing and packet semantics.
 
 The initial address type is IPv4. Network protocol identifiers use the IP protocol number space (for example ICMP=1, TCP=6, UDP=17). The first virtual switch delivers datagrams only; TCP/IP protocol implementations belong in the guest network stack and are not implied by this transport layer.
 
-## CPU and disk compatibility
+## Existing CPU2 compatibility findings
 
-The intended guest ISA is the existing CPU2 instruction set. Do not invent opcodes, registers, interrupt numbers or I/O ports. Before implementing the VM CPU, inspect and extract the existing CPU execution model from the legacy emulator source into a reusable core. The existing virtual disk format is a compatibility candidate, but it must be inspected and given a documented block-device boundary before being reused.
+The current desktop implementation is still in the root `main.cpp`. Its `CPU` class contains two execution paths: a source-line interpreter used by the editor and a seven-byte instruction bytecode engine used by compiled `.exe` images. The class currently owns a fixed 1 MiB RAM array, a 64 KiB firmware ROM, CPU registers/flags/cache, and direct dependencies on the desktop `VirtualDisk` and terminal input/output.
+
+The existing I/O behavior includes the documented terminal, keyboard and disk ports, plus software interrupt behavior. Disk operations currently call the desktop `VirtualDisk` directly. The compiled-bytecode path and memory representation also need a careful compatibility review before extraction; the bytecode instruction pointer currently indexes the bytecode vector, while instructions are also copied into RAM.
+
+**Do not replace this CPU with a newly invented ISA.** The server VM now defines a hardware boundary and a `CpuCore` contract, but the real CPU2 implementation is not yet connected to it. The next CPU step is a separate extraction/refactor: preserve the existing registers, opcodes, flags, interrupt semantics and port numbers while moving disk/terminal effects behind virtual devices. The root `main.cpp` remains unchanged in this phase.
+
+The existing 10 MiB `VirtualDisk` format is a compatibility candidate, not yet a guest block device. It currently owns host-file persistence and a guest-style filesystem in one class. A later storage phase must separate an opaque host-backed disk image from the guest filesystem and expose only sector/block operations to the guest.
+
+## Current VM hardware foundation
+
+The server library now provides:
+
+- per-machine configurable RAM allocation (default 1 MiB), with bounds-checked byte/word access and bounded image loading;
+- a port-mapped `DeviceBus` with overlap checks and explicit attach/detach;
+- an `IODevice` contract for virtual hardware;
+- a `MachineConfig` validator;
+- a `VirtualMachine` composition object with isolated RAM, device bus, CPU slot and deterministic instruction-cycle budget;
+- a `CpuCore` interface so a real CPU implementation can be installed without making the VM depend on the desktop UI.
+
+The VM deliberately reports `CpuNotConfigured` until a real CPU core is installed. Test-only fake CPUs verify scheduling and isolation; they are not shipped as a guest CPU implementation. There is not yet a disk controller, bootable machine, guest OS, or actual CPU2 core integration.
 
 ## Development phases
 
-1. **Architecture and network contract** — this change: document boundaries and provide a deterministic in-process virtual switch.
-2. **LAN transport** — portable host socket transport and explicit network configuration; test between separate processes and physical hosts.
-3. **VM hardware** — CPU core extraction, configurable RAM, bus and virtual devices.
-4. **Boot and guest storage** — disk-image block device, bootloader and guest filesystem.
+1. **VM hardware boundary** — configurable RAM, device bus, CPU contract, deterministic run loop and tests.
+2. **CPU2 core extraction** — move the real compiled-bytecode execution engine into a reusable headless core; isolate legacy source-line interpretation and route I/O through devices without changing the ISA.
+3. **Virtual storage** — disk image/block-device boundary, sector I/O and compatibility tests for existing disk data.
+4. **Boot and guest storage** — boot ROM/loader and a guest filesystem that runs inside the VM.
 5. **Guest OS** — kernel, drivers, process/user/service managers and guest shell.
-6. **Guest networking** — guest-side IPv4, ICMP, UDP/TCP and server services.
-7. **Desktop integration** — CPU16 Desktop becomes a guest network client; do not couple the server kernel to desktop UI code.
+6. **Guest networking** — attach the existing network adapter to each VM, then implement guest-side IPv4, ICMP, UDP/TCP and server services.
+7. **LAN transport** — portable host socket transport and explicit network configuration; test between separate processes and physical hosts.
+8. **Desktop integration** — CPU16 Desktop becomes a guest network client; do not couple the server kernel to desktop UI code.
 
 ## Compatibility and safety rules
 
