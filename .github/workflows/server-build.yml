@@ -1,0 +1,28 @@
+name: Server build
+
+on:
+  push:
+    branches: [feature/cpu16-server-os]
+    paths:
+      - "Server/**"
+      - ".github/workflows/server-build.yml"
+  pull_request:
+    paths:
+      - "Server/**"
+      - ".github/workflows/server-build.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S Server -B build-server
+      - name: Build
+        run: cmake --build build-server --config Release --parallel
