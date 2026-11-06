@@ -10,10 +10,21 @@ add_library(cpu16_server_network
 target_include_directories(cpu16_server_network PUBLIC include)
 target_compile_features(cpu16_server_network PUBLIC cxx_std_17)
 
+add_library(cpu16_server_vm
+    src/vm/MachineConfig.cpp
+    src/vm/Memory.cpp
+    src/vm/DeviceBus.cpp
+    src/vm/VirtualMachine.cpp
+)
+target_include_directories(cpu16_server_vm PUBLIC include)
+target_compile_features(cpu16_server_vm PUBLIC cxx_std_17)
+
 if(MSVC)
     target_compile_options(cpu16_server_network PRIVATE /W4 /permissive-)
+    target_compile_options(cpu16_server_vm PRIVATE /W4 /permissive-)
 else()
     target_compile_options(cpu16_server_network PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(cpu16_server_vm PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 if(BUILD_TESTING)
@@ -22,4 +33,10 @@ if(BUILD_TESTING)
     )
     target_link_libraries(cpu16_server_network_tests PRIVATE cpu16_server_network)
     add_test(NAME cpu16_server_network_tests COMMAND cpu16_server_network_tests)
+
+    add_executable(cpu16_server_vm_tests
+        tests/VirtualMachineTests.cpp
+    )
+    target_link_libraries(cpu16_server_vm_tests PRIVATE cpu16_server_vm)
+    add_test(NAME cpu16_server_vm_tests COMMAND cpu16_server_vm_tests)
 endif()
