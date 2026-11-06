@@ -8,7 +8,7 @@ struct MachineRecord {
     std::string id;
     vm::MachineConfig config;
     std::uint64_t diskSizeBytes{64ULL*1024ULL*1024ULL};
-    std::string diskImage{"disk0.cpu16disk"};
+    std::string diskImage{};
 };
 class MachineCatalog {
 public:
