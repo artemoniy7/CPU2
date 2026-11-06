@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 
 ServerShell::ServerShell(ServerState& state, ConfigManager& config)
     : state_(state), config_(config) {}
