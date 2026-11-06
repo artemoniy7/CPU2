@@ -1,6 +1,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <windowsx.h>
 #include <shellapi.h>
 #include <commctrl.h>
 #include <filesystem>
@@ -59,9 +60,13 @@ void refresh() {
     InvalidateRect(mainWindow, nullptr, TRUE);
 }
 void drawPage(HDC dc, RECT client) {
-    FillRect(dc, &client, CreateSolidBrush(Bg));
+    HBRUSH backgroundBrush = CreateSolidBrush(Bg);
+    FillRect(dc, &client, backgroundBrush);
+    DeleteObject(backgroundBrush);
     RECT side{0, 0, 224, client.bottom};
-    FillRect(dc, &side, CreateSolidBrush(Sidebar));
+    HBRUSH sidebarBrush = CreateSolidBrush(Sidebar);
+    FillRect(dc, &side, sidebarBrush);
+    DeleteObject(sidebarBrush);
     text(dc, 26, 25, L"CPU16", Accent, 27, true);
     text(dc, 26, 58, L"SERVER MANAGER", Muted, 11, true);
     const wchar_t* nav[] = {L"Overview", L"Virtual machines", L"Storage", L"Networks", L"Event log"};
