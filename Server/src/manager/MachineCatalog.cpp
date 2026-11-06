@@ -3,6 +3,7 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <utility>
 namespace cpu16::manager {
 namespace {
 bool fail(std::string* e,const char* m){if(e)*e=m;return false;}
