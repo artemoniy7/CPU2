@@ -4,10 +4,7 @@
 #include <string>
 #include <vector>
 
-enum class ServerMode {
-    Standalone,
-    Attached
-};
+enum class ServerMode { Standalone, Attached };
 
 struct ServiceInfo {
     std::string name;
@@ -31,14 +28,24 @@ public:
 
     const std::vector<ServiceInfo>& services() const noexcept;
     ServiceInfo* findService(const std::string& name);
+
+    void setLogFile(const std::string& path);
+    const std::string& logFilePath() const noexcept;
+    bool loggingAvailable() const noexcept;
     void addLog(const std::string& message);
+    bool clearLog();
     const std::vector<std::string>& log() const noexcept;
 
 private:
+    bool appendLogLine(const std::string& line);
+    void loadRecentLog();
+
     ServerMode mode_;
     bool running_{true};
     std::string hostname_{"CPU16-SERVER"};
     std::chrono::steady_clock::time_point startedAt_;
     std::vector<ServiceInfo> services_;
     std::vector<std::string> log_;
+    std::string logFilePath_{"logs/server.log"};
+    bool loggingAvailable_{true};
 };
