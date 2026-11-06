@@ -1,6 +1,6 @@
 # CPU-16 Server OS
 
-Separate server-side application for the CPU2 virtual computer project.
+Separate server-side application for CPU2.
 
 ## Build
 
@@ -11,8 +11,6 @@ cmake -S . -B build
 cmake --build build --config Release
 ```
 
-The executable is named `cpu_server` (or `cpu_server.exe` on Windows).
-
 ## Run
 
 ```sh
@@ -21,17 +19,27 @@ cpu_server --attached
 cpu_server --help
 ```
 
-## Current status
+## Shell commands
 
-This is the first shell/bootstrap milestone. It does not yet execute guest CPU instructions,
-load guest programs, access the emulator's virtual disk, or establish IPC.
+`HELP`, `STATUS`, `VERSION`, `HOSTNAME [name]`, `UPTIME`, `WHOAMI`,
+`ECHO`, `CLEAR`, `MACHINES`, `SERVICES`, `SERVICE START|STOP|INFO <name>`,
+`PROCESS`, `NETSTAT`, `LOG`, `SHUTDOWN`.
 
-## Planned architecture
+## Current implementation boundary
 
-- CPU Core: shared CPU, memory, interrupts and virtual-disk library extracted from the emulator.
-- Standalone host: owns a headless virtual machine instance.
-- Attached host: connects to an emulator-owned instance through IPC.
-- Process and service managers: guest-program lifecycle and background services.
-- Network manager: host TCP transport and guest-facing network API.
+The shell, hostname, uptime counter, bounded in-memory event log and service-state
+registry are implemented. CLOCK is a built-in state entry. SPOOLER, HTTPD and FTPD
+are placeholders; they do not launch guest programs or listen on network ports.
 
-The emulator and server must never share C++ object pointers across process boundaries.
+The process list, machine registry, CPU Core, IPC and network stack are not connected.
+Attached mode currently selects a mode label only; it does not yet connect to cpu_emu.
+
+## Architecture
+
+- CPU Core: planned shared library extracted from the emulator.
+- Standalone mode: will own a headless virtual machine.
+- Attached mode: will connect to an emulator-owned machine through IPC.
+- Service Manager: will launch and supervise guest programs.
+- Network Manager: will provide host transport and guest-facing network APIs.
+
+Never share C++ object pointers between separate processes. Use a defined IPC protocol.
