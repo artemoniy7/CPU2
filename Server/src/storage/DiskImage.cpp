@@ -1,5 +1,6 @@
 #include "storage/DiskImage.h"
 
+#include <algorithm>
 #include <array>
 #include <limits>
 
