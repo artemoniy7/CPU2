@@ -91,7 +91,8 @@ int main() {
         require(machine.installCpu(std::move(cpu)), "CPU installation failed");
         require(!machine.installCpu(std::make_unique<TestCpu>()),
                 "VM must reject replacing an installed CPU");
-        require(machine.devices().attach(0x10, 4, portDevice),
+        auto vmPortDevice = std::make_shared<TestPortDevice>();
+        require(machine.devices().attach(0x10, 4, vmPortDevice),
                 "VM device attachment failed");
 
         RunResult run = machine.runFor(2);
