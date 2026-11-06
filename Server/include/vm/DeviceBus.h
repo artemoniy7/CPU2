@@ -2,6 +2,7 @@
 
 #include "vm/IODevice.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
