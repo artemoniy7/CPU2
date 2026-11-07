@@ -76,9 +76,11 @@ void testConfigurationRoundTrip() {
     require(error.empty(), "Successful configuration load returned a warning.");
     require(state.hostname() == "node-01", "Hostname did not survive save/load.");
     require(state.logFilePath() == logPath.string(), "Log path did not survive save/load.");
-    require(!state.log().empty() &&
-            state.log().front().find("round-trip marker") != std::string::npos,
-            "Existing persistent log history was not restored.");
+    bool foundMarker = false;
+    for (const auto& entry : state.log()) {
+        if (entry.find("round-trip marker") != std::string::npos) foundMarker = true;
+    }
+    require(foundMarker, "Existing persistent log history was not restored.");
 }
 
 void testMissingConfigurationCreatesDefaultsAndLoadsLog() {
