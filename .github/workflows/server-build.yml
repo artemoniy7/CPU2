@@ -14,7 +14,7 @@ on:
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }}
+    name: Build and test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -26,3 +26,5 @@ jobs:
         run: cmake -S Server -B build-server
       - name: Build
         run: cmake --build build-server --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build-server --build-config Release --output-on-failure
