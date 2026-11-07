@@ -29,7 +29,7 @@ public:
     const std::vector<ServiceInfo>& services() const noexcept;
     ServiceInfo* findService(const std::string& name);
 
-    void setLogFile(const std::string& path);
+    bool setLogFile(const std::string& path, std::string& error);
     const std::string& logFilePath() const noexcept;
     bool loggingAvailable() const noexcept;
     void addLog(const std::string& message);
@@ -38,7 +38,6 @@ public:
 
 private:
     bool appendLogLine(const std::string& line);
-    void loadRecentLog();
 
     ServerMode mode_;
     bool running_{true};
